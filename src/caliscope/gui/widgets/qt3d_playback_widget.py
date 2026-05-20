@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 from typing import cast
 
 import numpy as np
@@ -306,7 +307,10 @@ class Qt3DPlaybackWidget(QWidget):
         # Adaptive camera frustum scale: make frustum depth ~5% of scene extent.
         # build_camera_geometry computes depth as focal_length * scale, and typical
         # focal lengths are ~1000px, so scale ~ scene_extent * 5e-5.
-        self._default_camera_scale = scene_extent * 5e-5
+        # You can override at launch:
+        #   $env:CALISCOPE_CAMERA_SCALE_MULTIPLIER="3e-5"
+        camera_scale_multiplier = float(os.environ.get("CALISCOPE_CAMERA_SCALE_MULTIPLIER", "5e-5"))
+        self._default_camera_scale = max(scene_extent * camera_scale_multiplier, 1.0e-5)
         logger.info(
             f"Scene extent={scene_extent:.2f}m, "
             f"default camera scale={self._default_camera_scale:.6f}, "

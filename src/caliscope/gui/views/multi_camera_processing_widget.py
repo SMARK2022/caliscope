@@ -197,10 +197,17 @@ class MultiCameraProcessingWidget(QWidget):
         heatmap_layout.addWidget(heatmap_label)
 
         self._coverage_heatmap = CoverageHeatmapWidget()
-        self._coverage_heatmap.setMinimumSize(180, 180)
-        self._coverage_heatmap.setMaximumSize(250, 250)
+
+        # 8+ cameras need more than 250 px; do not cap the heatmap,
+        # otherwise the lower rows can be clipped.
+        self._coverage_heatmap.setMinimumSize(320, 320)
+        self._coverage_heatmap.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Expanding,
+        )
+
         heatmap_layout.addWidget(self._coverage_heatmap)
-        content_layout.addLayout(heatmap_layout)
+        content_layout.addLayout(heatmap_layout, stretch=2)
 
         # Right: frames processed + structural warnings
         right_side_layout = QVBoxLayout()
@@ -219,13 +226,17 @@ class MultiCameraProcessingWidget(QWidget):
         right_side_layout.addWidget(self._warnings_widget)
         right_side_layout.addStretch()
 
-        content_layout.addLayout(right_side_layout)
+        content_layout.addLayout(right_side_layout, stretch=1)
 
         self._coverage_content.hide()  # Start hidden
         coverage_layout.addWidget(self._coverage_content)
 
-        # Set minimum size so layout doesn't jump
-        self._coverage_container.setMinimumSize(350, 200)
+        # Set minimum size so 8-camera coverage heatmap is not clipped.
+        self._coverage_container.setMinimumSize(720, 390)
+        self._coverage_container.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.MinimumExpanding,
+        )
 
         bottom_section.addWidget(self._coverage_container, stretch=1)
 

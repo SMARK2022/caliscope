@@ -8,9 +8,9 @@ from pathlib import Path
 
 # Write faulthandler trace to a file that survives the segfault
 # (pipe buffers don't flush on SIGSEGV)
-_faulthandler_file = open(  # noqa: SIM115
-    os.path.join(tempfile.gettempdir(), "caliscope_faulthandler.log"), "w"
-)
+_faulthandler_path = Path(tempfile.gettempdir()) / "caliscope_faulthandler.log"
+_faulthandler_path.parent.mkdir(parents=True, exist_ok=True)
+_faulthandler_file = open(_faulthandler_path, "w", encoding="utf-8")  # noqa: SIM115
 faulthandler.enable(file=_faulthandler_file, all_threads=True)
 
 from caliscope import MODELS_DIR  # noqa: E402
@@ -48,6 +48,13 @@ def CLI_parser():
     # Linux + Wayland: VTK doesn't support native Wayland rendering, force XWayland
     if sys.platform == "linux" and os.environ.get("XDG_SESSION_TYPE") == "wayland":
         os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
+
+    # Windows Qt3D: DirectX RHI can fail to create graphics pipelines on some drivers.
+    # Prefer OpenGL for stable camera/frustum rendering.
+    if sys.platform.startswith("win"):
+        os.environ.setdefault("QT3D_RENDERER", "opengl")
+        os.environ.setdefault("QSG_RHI_BACKEND", "opengl")
+        os.environ.setdefault("QT_OPENGL", "desktop")
 
     os.environ.setdefault("QT_API", "pyside6")
 

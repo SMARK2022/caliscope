@@ -215,6 +215,25 @@ def _extract_calibration_arrays(
         # Handle NaN in obj_loc_z (planar board, z=0)
         obj_loc = np.nan_to_num(obj_loc, nan=0.0)
 
+        # OpenCV calibrateCamera initializes intrinsics from per-frame planar
+        # homographies. Nearly-collinear points can make findHomography fail,
+        # which then trips calibrateCamera's internal homography assertion.
+        obj_xy = obj_loc[:, :2]
+        img_xy = img_loc[:, :2]
+
+        if np.linalg.matrix_rank(obj_xy - obj_xy.mean(axis=0)) < 2:
+            logger.debug(f"Skipping frame {sync_index}: object points are degenerate")
+            continue
+
+        if np.linalg.matrix_rank(img_xy - img_xy.mean(axis=0)) < 2:
+            logger.debug(f"Skipping frame {sync_index}: image points are degenerate")
+            continue
+
+        H, _ = cv2.findHomography(obj_xy.astype(np.float32), img_xy.astype(np.float32), 0)
+        if H is None or H.shape != (3, 3) or not np.isfinite(H).all():
+            logger.debug(f"Skipping frame {sync_index}: invalid homography")
+            continue
+
         obj_points_list.append(obj_loc)
         img_points_list.append(img_loc)
 

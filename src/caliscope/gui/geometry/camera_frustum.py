@@ -20,8 +20,9 @@ def build_camera_geometry(camera_array: CameraArray, scale: float = 0.0005) -> d
                for calibration views. Use smaller values (e.g., 0.0002) when
                cameras dominate the scene relative to tracked points.
     """
-    if not camera_array.all_extrinsics_calibrated():
-        return None
+    # Render every camera that already has a valid pose.
+    # Do not require all cameras to be extrinsically calibrated: in multi-component
+    # rigs, Caliscope may leave some cameras unposed while the main component is valid.
 
     all_vertices = []
     all_triangles = []

@@ -28,8 +28,8 @@ class CoverageHeatmapWidget(QWidget):
     COLOR_HIGH = QColor(60, 200, 60)
 
     # Layout constants
-    MARGIN = 30  # Space for row/column labels
-    MIN_CELL_SIZE = 35  # Minimum pixels per cell to keep counts readable
+    MARGIN = 34  # Space for row/column labels
+    MIN_CELL_SIZE = 25  # Minimum pixels per cell; 25 fits 8+ cameras better
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
