@@ -408,8 +408,10 @@ class WorkspaceCoordinator(QObject):
         Load camera array from persistence and detect new cameras from video files.
 
         Any cameras discovered in the intrinsic directory that aren't in the
-        saved array will be added automatically. Also loads any persisted
-        intrinsic calibration reports for overlay restoration.
+        saved array will be added automatically. Existing cameras are checked
+        against the intrinsic video metadata so stale resolutions cannot poison
+        calibration. Also loads any persisted intrinsic calibration reports for
+        overlay restoration.
         """
         self.camera_array = self.camera_repository.load()
 
@@ -419,11 +421,47 @@ class WorkspaceCoordinator(QObject):
         for cam_id in all_cam_ids:
             if cam_id not in self.camera_array.cameras:
                 self._add_camera_from_source(cam_id)
+            else:
+                self._sync_camera_size_from_intrinsic_video(cam_id)
 
         # Load any persisted intrinsic reports for overlay restoration
         self._intrinsic_reports = self.intrinsic_report_repository.load_all()
         if self._intrinsic_reports:
             logger.info(f"Loaded intrinsic reports for cam_ids: {list(self._intrinsic_reports.keys())}")
+
+    def _sync_camera_size_from_intrinsic_video(self, cam_id: int) -> bool:
+        """Update a camera's size from its intrinsic video metadata.
+
+        Returns True when the persisted camera data changed. If the resolution
+        changes, existing calibration data is invalid because the camera matrix
+        and distortion model are tied to pixel coordinates.
+        """
+        if cam_id not in self.camera_array.cameras:
+            raise ValueError(f"No camera data for cam_id {cam_id}")
+
+        target_mp4_path = Path(self.workspace_guide.intrinsic_dir, f"cam_{cam_id}.mp4")
+        if not target_mp4_path.exists():
+            return False
+
+        video_properties = read_video_properties(target_mp4_path)
+        video_size = tuple(video_properties["size"])
+        camera = self.camera_array.cameras[cam_id]
+
+        if tuple(camera.size) == video_size:
+            return False
+
+        old_size = camera.size
+        logger.warning(
+            f"Camera {cam_id} size {old_size} does not match intrinsic video {video_size}. "
+            "Updating size and clearing stale calibration."
+        )
+        camera.size = video_size
+        camera.erase_calibration_data()
+        self._intrinsic_reports.pop(cam_id, None)
+        self._intrinsic_points.pop(cam_id, None)
+        self.intrinsic_report_repository.delete(cam_id)
+        self.camera_repository.save(self.camera_array)
+        return True
 
     def _add_camera_from_source(self, cam_id: int):
         """
@@ -471,6 +509,9 @@ class WorkspaceCoordinator(QObject):
 
         if not video_path.exists():
             raise ValueError(f"No intrinsic video for cam_id {cam_id}")
+
+        self._sync_camera_size_from_intrinsic_video(cam_id)
+        camera = self.camera_array.cameras[cam_id]
 
         # Get cached data for overlay restoration
         report = self._intrinsic_reports.get(cam_id)

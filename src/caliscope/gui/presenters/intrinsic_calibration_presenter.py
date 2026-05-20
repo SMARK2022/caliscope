@@ -27,6 +27,7 @@ from caliscope.core.point_data import ImagePoints
 from caliscope.packets import FramePacket, PointPacket
 from caliscope.recording.frame_packet_streamer import create_streamer
 from caliscope.recording.frame_source import FrameSource
+from caliscope.recording.video_utils import read_video_properties
 from caliscope.task_manager.cancellation import CancellationToken
 from caliscope.task_manager.task_handle import TaskHandle
 from caliscope.task_manager.task_manager import TaskManager
@@ -285,6 +286,8 @@ class IntrinsicCalibrationPresenter(QObject):
             logger.warning(f"Cannot start calibration in state {self.state}")
             return
 
+        self._refresh_image_size_from_video()
+
         logger.info(f"Starting calibration collection for cam_id {self._cam_id}")
 
         # Clear previous calibration data BEFORE setting collecting flag
@@ -305,6 +308,29 @@ class IntrinsicCalibrationPresenter(QObject):
         # Spawn batch collection thread
         self._collection_thread = Thread(target=self._run_collection, daemon=True)
         self._collection_thread.start()
+
+    def _refresh_image_size_from_video(self) -> None:
+        """Refresh in-memory image size from the intrinsic video metadata."""
+        try:
+            video_properties = read_video_properties(self._video_path)
+        except Exception as e:
+            logger.warning(f"Could not refresh image size for cam_id {self._cam_id}: {e}")
+            return
+
+        video_size = tuple(video_properties["size"])
+        if tuple(self._camera.size) == video_size:
+            return
+
+        old_size = self._camera.size
+        logger.warning(
+            f"Camera {self._cam_id} size {old_size} does not match intrinsic video {video_size}. "
+            "Updating in-memory size before calibration."
+        )
+        self._camera.size = video_size
+        self._camera.erase_calibration_data()
+        self._image_size = video_size
+        self._output = None
+        self._selection_result = None
 
     def stop_calibration(self) -> None:
         """Stop collection and return to READY state.
