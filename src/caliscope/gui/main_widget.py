@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QMainWindow,
     QMenu,
+    QMessageBox,
     QTabWidget,
     QWidget,
 )
@@ -81,6 +82,8 @@ class MainWindow(QMainWindow):
         assert app is not None
         self.exit_pyxy3d_action.triggered.connect(app.quit)
         self.open_log_directory_action.triggered.connect(self.open_log_dir)
+        self.import_intrinsics_file_action.triggered.connect(self.import_intrinsics_file)
+        self.import_intrinsics_folder_action.triggered.connect(self.import_intrinsics_folder)
 
     def build_menus(self):
         # File Menu
@@ -104,6 +107,12 @@ class MainWindow(QMainWindow):
 
         self.open_log_directory_action = QAction("Open Log Directory")
         self.file_menu.addAction(self.open_log_directory_action)
+        self.file_menu.addSeparator()
+        self.import_intrinsics_file_action = QAction("Import Intrinsics...", self)
+        self.file_menu.addAction(self.import_intrinsics_file_action)
+        self.import_intrinsics_folder_action = QAction("Import Intrinsics Folder...", self)
+        self.file_menu.addAction(self.import_intrinsics_folder_action)
+        self.file_menu.addSeparator()
         self.exit_pyxy3d_action = QAction("Exit", self)
         self.file_menu.addAction(self.exit_pyxy3d_action)
 
@@ -299,6 +308,52 @@ class MainWindow(QMainWindow):
             if self.central_tab.tabText(index) == title:
                 return index
         return -1  # Return -1 if the tab is not found
+
+    def import_intrinsics_file(self) -> None:
+        if not hasattr(self, "coordinator"):
+            QMessageBox.warning(self, "Import Intrinsics", "Open a project before importing intrinsics.")
+            return
+
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Import Intrinsics",
+            str(Path.home()),
+            "TOML Files (*.toml);;All Files (*)",
+        )
+        if file_path:
+            self._import_intrinsics(Path(file_path))
+
+    def import_intrinsics_folder(self) -> None:
+        if not hasattr(self, "coordinator"):
+            QMessageBox.warning(self, "Import Intrinsics", "Open a project before importing intrinsics.")
+            return
+
+        folder_path = QFileDialog.getExistingDirectory(self, "Import Intrinsics Folder", str(Path.home()))
+        if folder_path:
+            self._import_intrinsics(Path(folder_path))
+
+    def _import_intrinsics(self, path: Path) -> None:
+        try:
+            result = self.coordinator.import_intrinsics_library(path)
+        except Exception as e:
+            QMessageBox.critical(self, "Import Intrinsics", f"Failed to import intrinsics:\n{e}")
+            return
+
+        matched = result["matched"]
+        skipped = result["skipped"]
+        if isinstance(getattr(self, "cameras_tab_widget", None), CamerasTabWidget):
+            self.cameras_tab_widget.camera_list.refresh(self.coordinator.camera_array)
+
+        skipped_preview = "\n".join(
+            f"cam {item.get('cam_id')}: {item.get('reason')}" for item in skipped[:10]
+        )
+        if len(skipped) > 10:
+            skipped_preview += f"\n... {len(skipped) - 10} more skipped"
+
+        message = f"Imported intrinsics for {len(matched)} camera(s)."
+        if skipped_preview:
+            message += f"\n\nSkipped:\n{skipped_preview}"
+        QMessageBox.information(self, "Import Intrinsics", message)
 
     def _navigate_to_tab(self, tab_name: str) -> None:
         """Navigate to requested tab by name.

@@ -13,7 +13,7 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QBrush, QColor
 from PySide6.QtWidgets import QListWidget, QListWidgetItem
 
-from caliscope.cameras.camera_array import CameraArray
+from caliscope.cameras.camera_array import CameraArray, CameraData
 
 logger = logging.getLogger(__name__)
 
@@ -54,21 +54,41 @@ class CameraListWidget(QListWidget):
             self._cam_id_to_row[cam_id] = row
             item = QListWidgetItem()
             item.setData(Qt.ItemDataRole.UserRole, cam_id)
+            identity = self._camera_identity_text(camera)
 
             if camera.matrix is not None and camera.distortions is not None:
                 # Calibrated: filled circle + green text + optional RMSE
                 if camera.error is not None:
-                    text = f"\u25cf Cam {cam_id} \u2014 {camera.error:.2f}px"
+                    text = f"● Cam {cam_id} | {identity} | {camera.error:.2f}px"
                 else:
-                    text = f"\u25cf Cam {cam_id}"
+                    text = f"● Cam {cam_id} | {identity}"
                 item.setForeground(QBrush(QColor("#4CAF50")))  # Material green
             else:
                 # Not calibrated: hollow circle + red text
-                text = f"\u25cb Cam {cam_id}"
+                text = f"○ Cam {cam_id} | {identity}"
                 item.setForeground(QBrush(QColor("#F44336")))  # Material red
 
             item.setText(text)
+            item.setToolTip(self._camera_tooltip(cam_id, camera))
             self.addItem(item)
+
+    def _camera_identity_text(self, camera: CameraData) -> str:
+        return camera.label or camera.original_filename or camera.serial_number or "unmapped"
+
+    def _camera_tooltip(self, cam_id: int, camera: CameraData) -> str:
+        lines = [f"Cam {cam_id}"]
+        for label, value in (
+            ("Label", camera.label),
+            ("Serial", camera.serial_number),
+            ("Model", camera.model),
+            ("Original file", camera.original_filename),
+            ("Intrinsic video", camera.intrinsic_video),
+            ("Extrinsic video", camera.extrinsic_video),
+            ("Intrinsics source", camera.intrinsics_source),
+        ):
+            if value:
+                lines.append(f"{label}: {value}")
+        return "\n".join(lines)
 
     def _on_row_changed(self, row: int) -> None:
         """Handle selection change and emit camera_selected signal."""

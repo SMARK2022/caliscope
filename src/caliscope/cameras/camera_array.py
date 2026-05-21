@@ -37,6 +37,13 @@ class CameraData:
     exposure: int | None = None
     grid_count: int | None = None
     ignore: bool = False
+    label: str | None = None
+    serial_number: str | None = None
+    model: str | None = None
+    original_filename: str | None = None
+    intrinsic_video: str | None = None
+    extrinsic_video: str | None = None
+    intrinsics_source: str | None = None
     translation: np.ndarray | None = None  # camera relative to world
     rotation: np.ndarray | None = None  # camera relative to world
     fisheye: bool = False  # default to standard camera model
@@ -224,6 +231,13 @@ class CameraData:
                 ("Grid_Count", self.grid_count),
                 ("rotation_count", self.rotation_count),
                 ("fisheye", self.fisheye),
+                ("label", self.label),
+                ("serial_number", self.serial_number),
+                ("model", self.model),
+                ("original_filename", self.original_filename),
+                ("intrinsic_video", self.intrinsic_video),
+                ("extrinsic_video", self.extrinsic_video),
+                ("intrinsics_source", self.intrinsics_source),
                 (
                     "intrinsic_parameters",
                     OrderedDict(
@@ -439,6 +453,13 @@ class CameraArray:
                     exposure=_clean_scalar(camera_data.get("exposure")),
                     grid_count=_clean_scalar(camera_data.get("grid_count")),
                     ignore=camera_data.get("ignore", False),
+                    label=camera_data.get("label"),
+                    serial_number=camera_data.get("serial_number"),
+                    model=camera_data.get("model"),
+                    original_filename=camera_data.get("original_filename"),
+                    intrinsic_video=camera_data.get("intrinsic_video"),
+                    extrinsic_video=camera_data.get("extrinsic_video"),
+                    intrinsics_source=camera_data.get("intrinsics_source"),
                     translation=translation,
                     rotation=rotation,
                     fisheye=camera_data.get("fisheye", False),
@@ -483,6 +504,13 @@ class CameraArray:
                     "rotation": rotation_for_config,
                     "exposure": camera.exposure,
                     "grid_count": camera.grid_count,
+                    "label": camera.label,
+                    "serial_number": camera.serial_number,
+                    "model": camera.model,
+                    "original_filename": camera.original_filename,
+                    "intrinsic_video": camera.intrinsic_video,
+                    "extrinsic_video": camera.extrinsic_video,
+                    "intrinsics_source": camera.intrinsics_source,
                     "fisheye": camera.fisheye,
                 }
 
@@ -524,6 +552,9 @@ class CameraArray:
 
                 camera_dict = {
                     "name": f"cam_{cam_id}",
+                    "serial_number": camera.serial_number,
+                    "label": camera.label,
+                    "original_filename": camera.original_filename,
                     "size": [int(camera.size[0]), int(camera.size[1])],
                     "matrix": _array_to_list(camera.matrix),
                     "distortions": distortions_flat,
@@ -531,7 +562,7 @@ class CameraArray:
                     "translation": translation_flat,
                     "fisheye": camera.fisheye,
                 }
-                data[f"cam_{cam_id}"] = camera_dict
+                data[f"cam_{cam_id}"] = {k: v for k, v in camera_dict.items() if v is not None}
 
             data["metadata"] = {"adjusted": False, "error": 0.0}
             _safe_write_toml(data, path)

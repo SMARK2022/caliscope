@@ -21,6 +21,9 @@ __repo_issues_url__ = f"{__repo_url__}issues"
 # - Linux:   ~/.local/share/caliscope
 APP_DIR = Path(user_data_dir(appname=__package_name__))
 
+# User-managed configuration files that should be portable across Caliscope installs.
+CONFIG_DIR = Path.home() / ".config" / __package_name__
+
 # user_log_dir will be:
 # - Windows: C:\Users\<user>\AppData\Local\caliscope\caliscope\Logs
 # - macOS:   ~/Library/Logs/caliscope
@@ -33,6 +36,9 @@ APP_SETTINGS_PATH = APP_DIR / "settings.toml"
 
 # User-managed ONNX model directory
 MODELS_DIR = APP_DIR / "models"
+
+# Default read-only intrinsics library used by the Cameras tab one-click import.
+DEFAULT_INTRINSICS_LIBRARY_PATH = CONFIG_DIR / "intrinsics_library.toml"
 
 # A helpful reference to the source code root
 __root__ = Path(__file__).parent.parent.parent

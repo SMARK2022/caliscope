@@ -2,11 +2,14 @@ import logging
 from collections import OrderedDict
 from pathlib import Path
 from datetime import datetime
-from typing import Literal
+from typing import Any, Literal
 
 import cv2
+import numpy as np
+import rtoml
 from PySide6.QtCore import QObject, QFileSystemWatcher, Signal
 
+from caliscope import DEFAULT_INTRINSICS_LIBRARY_PATH
 from caliscope.task_manager import TaskHandle, TaskManager
 
 from caliscope.core.charuco import Charuco
@@ -16,6 +19,7 @@ from caliscope.cameras.camera_array import CameraArray, CameraData
 from caliscope.core.calibrate_intrinsics import IntrinsicCalibrationOutput, IntrinsicCalibrationReport
 from caliscope.repositories import (
     CameraArrayRepository,
+    CameraSourcesRepository,
     CalibrationTargetsRepository,
     ProjectSettingsRepository,
 )
@@ -79,6 +83,7 @@ class WorkspaceCoordinator(QObject):
         # Initialize repositories with explicit file paths
         self.settings_repository = ProjectSettingsRepository(workspace_dir / "project_settings.toml")
         self.camera_repository = CameraArrayRepository(workspace_dir / "camera_array.toml")
+        self.camera_sources_repository = CameraSourcesRepository(workspace_dir)
         self.targets_repository = CalibrationTargetsRepository(workspace_dir / "calibration" / "targets")
         self.intrinsic_report_repository = IntrinsicReportRepository(
             workspace_dir / "calibration" / "intrinsic" / "reports"
@@ -231,6 +236,7 @@ class WorkspaceCoordinator(QObject):
             if self.cameras_tab_enabled:
                 logger.info("Loading camera array (intrinsic videos available)")
                 self.load_camera_array()
+                self.sync_camera_sources()
             else:
                 logger.info("Skipping camera array load (no intrinsic videos)")
 
@@ -429,6 +435,32 @@ class WorkspaceCoordinator(QObject):
         if self._intrinsic_reports:
             logger.info(f"Loaded intrinsic reports for cam_ids: {list(self._intrinsic_reports.keys())}")
 
+    def sync_camera_sources(self) -> None:
+        """Refresh source metadata from mapping files and MP4 CASN data."""
+        sources = self.camera_sources_repository.refresh_from_workspace_videos()
+        changed = False
+
+        for cam_id, camera in self.camera_array.cameras.items():
+            source = sources.get(cam_id)
+            if source is None:
+                continue
+
+            updates = {
+                "label": source.label,
+                "serial_number": source.serial_number,
+                "model": source.model,
+                "original_filename": source.original_filename,
+                "intrinsic_video": source.intrinsic_video,
+                "extrinsic_video": source.extrinsic_video,
+            }
+            for field, value in updates.items():
+                if value is not None and getattr(camera, field) != value:
+                    setattr(camera, field, value)
+                    changed = True
+
+        if changed:
+            self.camera_repository.save(self.camera_array)
+
     def _sync_camera_size_from_intrinsic_video(self, cam_id: int) -> bool:
         """Update a camera's size from its intrinsic video metadata.
 
@@ -526,6 +558,210 @@ class WorkspaceCoordinator(QObject):
             restored_points=collected_points,
             frame_skip=self._intrinsic_frame_skip,
         )
+
+    def import_intrinsics_library(self, library_path: Path) -> dict[str, Any]:
+        """Import intrinsic profiles by matching camera serial numbers.
+
+        The library can be a single TOML file, a folder containing TOML files,
+        or a Caliscope workspace containing camera_array.toml plus source data.
+        """
+        self.sync_camera_sources()
+        profiles = self._load_intrinsics_profiles(library_path)
+        matched: list[int] = []
+        skipped: list[dict[str, Any]] = []
+        intrinsics_changed = False
+
+        for cam_id, camera in self.camera_array.cameras.items():
+            serial = camera.serial_number
+            if serial is None:
+                skipped.append({"cam_id": cam_id, "reason": "missing camera serial"})
+                continue
+
+            profile = profiles.get(serial)
+            if profile is None:
+                skipped.append({"cam_id": cam_id, "serial_number": serial, "reason": "no matching profile"})
+                continue
+
+            profile_size = tuple(profile["size"])
+            if tuple(camera.size) != profile_size:
+                skipped.append(
+                    {
+                        "cam_id": cam_id,
+                        "serial_number": serial,
+                        "reason": "size mismatch",
+                        "camera_size": camera.size,
+                        "profile_size": profile_size,
+                    }
+                )
+                continue
+
+            try:
+                matrix, distortions = self._validated_intrinsics_arrays(profile)
+            except ValueError as e:
+                skipped.append({"cam_id": cam_id, "serial_number": serial, "reason": str(e)})
+                continue
+
+            if not self._camera_intrinsics_match(camera, matrix, distortions, bool(profile.get("fisheye", False))):
+                intrinsics_changed = True
+
+            camera.matrix = matrix
+            camera.distortions = distortions
+            camera.fisheye = bool(profile.get("fisheye", False))
+            camera.error = profile.get("rmse", profile.get("error"))
+            camera.grid_count = profile.get("frames_used", profile.get("grid_count"))
+            camera.intrinsics_source = str(library_path)
+            self._intrinsic_reports[cam_id] = self._report_from_intrinsics_profile(profile)
+            self.intrinsic_report_repository.save(cam_id, self._intrinsic_reports[cam_id])
+            matched.append(cam_id)
+
+        if matched:
+            if intrinsics_changed:
+                self._clear_extrinsics("Imported intrinsics changed")
+            self.camera_repository.save(self.camera_array)
+            self.status_changed.emit()
+
+        return {"matched": matched, "skipped": skipped}
+
+    def import_default_intrinsics_library(self) -> dict[str, Any]:
+        """Import from the user-level read-only intrinsics library."""
+        if not DEFAULT_INTRINSICS_LIBRARY_PATH.exists():
+            raise FileNotFoundError(f"Default intrinsics library not found: {DEFAULT_INTRINSICS_LIBRARY_PATH}")
+        return self.import_intrinsics_library(DEFAULT_INTRINSICS_LIBRARY_PATH)
+
+    def _load_intrinsics_profiles(self, library_path: Path) -> dict[str, dict[str, Any]]:
+        if library_path.is_dir():
+            workspace_camera_array = library_path / "camera_array.toml"
+            if workspace_camera_array.exists():
+                return self._load_intrinsics_profiles_from_workspace(library_path)
+
+            profiles: dict[str, dict[str, Any]] = {}
+            for path in library_path.glob("*.toml"):
+                profiles.update(self._load_intrinsics_profiles_from_file(path))
+            return profiles
+
+        return self._load_intrinsics_profiles_from_file(library_path)
+
+    def _load_intrinsics_profiles_from_file(self, path: Path) -> dict[str, dict[str, Any]]:
+        data = rtoml.load(path)
+        if "cameras" in data:
+            camera_array = CameraArray.from_toml(path)
+            profiles: dict[str, dict[str, Any]] = {}
+            for cam_id, camera in camera_array.cameras.items():
+                if camera.serial_number is None or camera.matrix is None or camera.distortions is None:
+                    continue
+                profiles[camera.serial_number] = self._profile_from_camera_data(camera, source=str(path), source_cam_id=cam_id)
+            return profiles
+
+        raw_profiles = data.get("profiles", data)
+        profiles: dict[str, dict[str, Any]] = {}
+
+        for key, value in raw_profiles.items():
+            if not isinstance(value, dict):
+                continue
+            serial = value.get("serial") or value.get("serial_number") or key
+            if self._is_valid_intrinsics_profile(value):
+                profiles[str(serial)] = value
+        return profiles
+
+    def _load_intrinsics_profiles_from_workspace(self, workspace_path: Path) -> dict[str, dict[str, Any]]:
+        camera_array = CameraArray.from_toml(workspace_path / "camera_array.toml")
+        source_repo = CameraSourcesRepository(workspace_path)
+        sources = source_repo.refresh_from_workspace_videos(save=False)
+        reports = IntrinsicReportRepository(workspace_path / "calibration" / "intrinsic" / "reports").load_all()
+        profiles: dict[str, dict[str, Any]] = {}
+
+        for cam_id, camera in camera_array.cameras.items():
+            serial = camera.serial_number or (sources.get(cam_id).serial_number if sources.get(cam_id) else None)
+            if serial is None or camera.matrix is None or camera.distortions is None:
+                continue
+            profiles[serial] = {
+                "serial": serial,
+                "size": list(camera.size),
+                "fisheye": camera.fisheye,
+                "matrix": camera.matrix.tolist(),
+                "distortions": camera.distortions.ravel().tolist(),
+                "rmse": camera.error,
+                "grid_count": camera.grid_count,
+                "source_workspace": str(workspace_path),
+                "source_cam_id": cam_id,
+            }
+            report = reports.get(cam_id)
+            if report is not None:
+                profiles[serial].update(
+                    {
+                        "frames_used": report.frames_used,
+                        "coverage_fraction": report.coverage_fraction,
+                        "edge_coverage_fraction": report.edge_coverage_fraction,
+                        "corner_coverage_fraction": report.corner_coverage_fraction,
+                        "orientation_sufficient": report.orientation_sufficient,
+                        "orientation_count": report.orientation_count,
+                        "selected_frames": list(report.selected_frames),
+                    }
+                )
+        return profiles
+
+    def _profile_from_camera_data(self, camera: CameraData, source: str, source_cam_id: int) -> dict[str, Any]:
+        return {
+            "serial": camera.serial_number,
+            "size": list(camera.size),
+            "fisheye": camera.fisheye,
+            "matrix": camera.matrix.tolist() if camera.matrix is not None else None,
+            "distortions": camera.distortions.ravel().tolist() if camera.distortions is not None else None,
+            "rmse": camera.error,
+            "grid_count": camera.grid_count,
+            "source": source,
+            "source_cam_id": source_cam_id,
+        }
+
+    def _is_valid_intrinsics_profile(self, profile: dict[str, Any]) -> bool:
+        return all(profile.get(key) is not None for key in ("size", "matrix", "distortions"))
+
+    def _validated_intrinsics_arrays(self, profile: dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
+        matrix = np.asarray(profile["matrix"], dtype=np.float64)
+        if matrix.shape != (3, 3):
+            raise ValueError(f"invalid matrix shape {matrix.shape}")
+
+        distortions = np.asarray(profile["distortions"], dtype=np.float64).ravel()
+        expected_distortion_count = 4 if bool(profile.get("fisheye", False)) else 5
+        if distortions.shape != (expected_distortion_count,):
+            raise ValueError(f"invalid distortion count {distortions.size}")
+
+        return matrix, distortions
+
+    def _report_from_intrinsics_profile(self, profile: dict[str, Any]) -> IntrinsicCalibrationReport:
+        return IntrinsicCalibrationReport(
+            rmse=float(profile.get("rmse", profile.get("error", 0.0)) or 0.0),
+            frames_used=int(profile.get("frames_used", profile.get("grid_count", 0)) or 0),
+            coverage_fraction=float(profile.get("coverage_fraction", 0.0) or 0.0),
+            edge_coverage_fraction=float(profile.get("edge_coverage_fraction", 0.0) or 0.0),
+            corner_coverage_fraction=float(profile.get("corner_coverage_fraction", 0.0) or 0.0),
+            orientation_sufficient=bool(profile.get("orientation_sufficient", False)),
+            orientation_count=int(profile.get("orientation_count", 0) or 0),
+            selected_frames=tuple(profile.get("selected_frames", ())),
+        )
+
+    def _camera_intrinsics_match(
+        self,
+        camera: CameraData,
+        matrix: np.ndarray,
+        distortions: np.ndarray,
+        fisheye: bool,
+    ) -> bool:
+        if camera.matrix is None or camera.distortions is None:
+            return False
+        if bool(camera.fisheye) != fisheye:
+            return False
+        if camera.matrix.shape != matrix.shape or camera.distortions.ravel().shape != distortions.shape:
+            return False
+        return np.allclose(camera.matrix, matrix) and np.allclose(camera.distortions.ravel(), distortions)
+
+    def _clear_extrinsics(self, reason: str) -> None:
+        logger.warning(f"{reason}; clearing stale extrinsics and cached capture volume.")
+        for camera in self.camera_array.cameras.values():
+            camera.rotation = None
+            camera.translation = None
+        self._capture_volume = None
+        self.capture_volume_updated.emit()
 
     @property
     def intrinsic_frame_skip(self) -> int:
@@ -637,6 +873,8 @@ class WorkspaceCoordinator(QObject):
         output_path = tracker_dir / "image_points.csv"
         image_points.to_csv(output_path)
 
+        self._clear_extrinsics("Extrinsic image points changed")
+        self.camera_repository.save(self.camera_array)
         logger.info(f"Persisted extrinsic image points: {len(image_points.df)} observations to {output_path}")
         self.status_changed.emit()
 
@@ -677,9 +915,20 @@ class WorkspaceCoordinator(QObject):
                 overlay restoration during session. Not persisted to disk.
         """
         cam_id = output.camera.cam_id
+        previous_camera = self.camera_array.cameras.get(cam_id)
+        intrinsics_changed = True
+        if previous_camera is not None and output.camera.matrix is not None and output.camera.distortions is not None:
+            intrinsics_changed = not self._camera_intrinsics_match(
+                previous_camera,
+                output.camera.matrix,
+                output.camera.distortions.ravel(),
+                output.camera.fisheye,
+            )
 
         # Update camera in array and save
         self.camera_array.cameras[cam_id] = output.camera
+        if intrinsics_changed:
+            self._clear_extrinsics("Intrinsic calibration changed")
         self.camera_repository.save(self.camera_array)
 
         # Cache report for overlay restoration and save to disk
@@ -716,18 +965,72 @@ class WorkspaceCoordinator(QObject):
         3. Return None if no data available
         """
         if self._capture_volume is not None:
+            if not self._capture_volume_intrinsics_match(self._capture_volume):
+                logger.warning("Ignoring cached capture volume because intrinsics changed.")
+                self._capture_volume = None
+                return None
+            if not self._capture_volume_source_data_is_current():
+                logger.warning("Ignoring cached capture volume because extrinsic source data changed.")
+                self._capture_volume = None
+                return None
             return self._capture_volume
 
         # Try loading from capture volume repository
         if self.capture_volume_repository.camera_array_path.exists():
             try:
-                self._capture_volume = self.capture_volume_repository.load()
+                loaded_capture_volume = self.capture_volume_repository.load()
+                if not self._capture_volume_intrinsics_match(loaded_capture_volume):
+                    logger.warning("Ignoring persisted capture volume because intrinsics changed.")
+                    return None
+                if not self._capture_volume_source_data_is_current():
+                    logger.warning("Ignoring persisted capture volume because extrinsic source data changed.")
+                    return None
+                self._capture_volume = loaded_capture_volume
                 logger.info("Loaded CaptureVolume from repository")
                 return self._capture_volume
             except PersistenceError as e:
                 logger.warning(f"Bundle repository exists but load failed: {e}")
 
         return None
+
+    def _capture_volume_source_data_is_current(self) -> bool:
+        if not self.extrinsic_image_points_path.exists():
+            return False
+        if not self.capture_volume_repository.image_points_path.exists():
+            return False
+
+        source_mtime = self.extrinsic_image_points_path.stat().st_mtime
+        snapshot_paths = (
+            self.capture_volume_repository.camera_array_path,
+            self.capture_volume_repository.image_points_path,
+            self.capture_volume_repository.world_points_path,
+        )
+        if any(not path.exists() for path in snapshot_paths):
+            return False
+        return source_mtime <= min(path.stat().st_mtime for path in snapshot_paths)
+
+    def _capture_volume_intrinsics_match(self, capture_volume: CaptureVolume) -> bool:
+        for cam_id, current_camera in self.camera_array.cameras.items():
+            volume_camera = capture_volume.camera_array.cameras.get(cam_id)
+            if volume_camera is None:
+                return False
+            if current_camera.matrix is None or current_camera.distortions is None:
+                return False
+            if volume_camera.matrix is None or volume_camera.distortions is None:
+                return False
+            if tuple(current_camera.size) != tuple(volume_camera.size):
+                return False
+            if bool(current_camera.fisheye) != bool(volume_camera.fisheye):
+                return False
+            if current_camera.matrix.shape != volume_camera.matrix.shape:
+                return False
+            if current_camera.distortions.ravel().shape != volume_camera.distortions.ravel().shape:
+                return False
+            if not np.allclose(current_camera.matrix, volume_camera.matrix):
+                return False
+            if not np.allclose(current_camera.distortions.ravel(), volume_camera.distortions.ravel()):
+                return False
+        return True
 
     def update_capture_volume(self, capture_volume: CaptureVolume) -> None:
         """Update the in-memory capture volume and persist in background.

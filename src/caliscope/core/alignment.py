@@ -200,6 +200,13 @@ def apply_similarity_transform(
             exposure=camera_data.exposure,
             grid_count=camera_data.grid_count,
             ignore=camera_data.ignore,
+            label=camera_data.label,
+            serial_number=camera_data.serial_number,
+            model=camera_data.model,
+            original_filename=camera_data.original_filename,
+            intrinsic_video=camera_data.intrinsic_video,
+            extrinsic_video=camera_data.extrinsic_video,
+            intrinsics_source=camera_data.intrinsics_source,
             fisheye=camera_data.fisheye,
         )
 

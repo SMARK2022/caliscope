@@ -14,6 +14,8 @@ from typing import TYPE_CHECKING
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
+    QMessageBox,
+    QPushButton,
     QSpinBox,
     QSplitter,
     QVBoxLayout,
@@ -21,6 +23,7 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt
 
+from caliscope import DEFAULT_INTRINSICS_LIBRARY_PATH
 from caliscope.core.calibrate_intrinsics import IntrinsicCalibrationOutput
 from caliscope.gui.theme import Colors
 from caliscope.gui.utils.chessboard_preview import render_chessboard_pixmap
@@ -88,6 +91,19 @@ class CamerasTabWidget(QWidget):
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_layout.setSpacing(8)
 
+        self._import_default_intrinsics_btn = QPushButton("Import Default Intrinsics")
+        self._import_default_intrinsics_btn.setToolTip(
+            f"Replace current project intrinsics using the read-only default library:\n"
+            f"{DEFAULT_INTRINSICS_LIBRARY_PATH}"
+        )
+        left_layout.addWidget(self._import_default_intrinsics_btn)
+
+        self._default_intrinsics_status = QLabel("Default intrinsics library")
+        self._default_intrinsics_status.setToolTip(str(DEFAULT_INTRINSICS_LIBRARY_PATH))
+        self._default_intrinsics_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._default_intrinsics_status.setStyleSheet("color: #888; font-size: 11px;")
+        left_layout.addWidget(self._default_intrinsics_status)
+
         self.camera_list = CameraListWidget(self.coordinator.camera_array)
         self.camera_list.setMinimumWidth(150)
         left_layout.addWidget(self.camera_list, stretch=1)
@@ -147,6 +163,39 @@ class CamerasTabWidget(QWidget):
         self.camera_list.camera_selected.connect(self._on_camera_selected)
         self.coordinator.intrinsic_target_changed.connect(self._on_intrinsic_target_changed)
         self._frame_skip_spin.valueChanged.connect(self._on_frame_skip_changed)
+        self._import_default_intrinsics_btn.clicked.connect(self._on_import_default_intrinsics_clicked)
+
+    def _on_import_default_intrinsics_clicked(self) -> None:
+        """Replace project intrinsics from the default global library."""
+        current_item = self.camera_list.currentItem()
+        current_cam_id = current_item.data(Qt.ItemDataRole.UserRole) if current_item else None
+
+        try:
+            result = self.coordinator.import_default_intrinsics_library()
+        except Exception as e:
+            QMessageBox.warning(self, "Import Default Intrinsics", str(e))
+            return
+
+        self._dispose_presenter_pool()
+        self.camera_list.refresh(self.coordinator.camera_array)
+        if current_cam_id is not None:
+            self.camera_list.blockSignals(True)
+            try:
+                self.camera_list.select_cam_id(current_cam_id)
+            finally:
+                self.camera_list.blockSignals(False)
+            self._on_camera_selected(current_cam_id)
+
+        matched = result["matched"]
+        skipped = result["skipped"]
+        skipped_preview = "\n".join(f"cam {item.get('cam_id')}: {item.get('reason')}" for item in skipped[:10])
+        if len(skipped) > 10:
+            skipped_preview += f"\n... {len(skipped) - 10} more skipped"
+
+        message = f"Imported default intrinsics for {len(matched)} camera(s)."
+        if skipped_preview:
+            message += f"\n\nSkipped:\n{skipped_preview}"
+        QMessageBox.information(self, "Import Default Intrinsics", message)
 
     def _on_intrinsic_target_changed(self) -> None:
         """Update tracker in all pooled presenters and refresh preview."""
@@ -258,6 +307,9 @@ class CamerasTabWidget(QWidget):
         removeTab() + deleteLater() doesn't trigger closeEvent.
         The parent (MainWidget) must call this during reload_workspace.
         """
+        self._dispose_presenter_pool()
+
+    def _dispose_presenter_pool(self) -> None:
         for cam_id, presenter in self._presenters.items():
             logger.info(f"Cleaning up presenter for cam {cam_id}")
             presenter.cleanup()
