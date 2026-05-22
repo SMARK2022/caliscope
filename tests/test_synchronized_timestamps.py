@@ -55,6 +55,47 @@ class TestFromCsv:
         synced = SynchronizedTimestamps.from_csv(EXTRINSIC_DIR)
         assert synced.sync_indices[0] == 0
 
+    def test_explicit_sync_mapping_preserved_when_frame_index_present(self, tmp_path: Path):
+        """Audio-synced CSVs preserve sync_index groups and original frame indices."""
+        pd.DataFrame(
+            [
+                {"sync_index": 10, "cam_id": 0, "frame_index": 100, "frame_time": 0.0},
+                {"sync_index": 10, "cam_id": 1, "frame_index": 205, "frame_time": 0.0},
+                {"sync_index": 20, "cam_id": 0, "frame_index": 101, "frame_time": 1 / 30},
+                {"sync_index": 20, "cam_id": 1, "frame_index": 206, "frame_time": 1 / 30},
+            ]
+        ).to_csv(tmp_path / "timestamps.csv", index=False)
+
+        synced = SynchronizedTimestamps.from_csv(tmp_path)
+
+        assert synced.sync_indices == [10, 20]
+        assert synced.frame_for(10, 0) == 100
+        assert synced.frame_for(10, 1) == 205
+        assert synced.frame_for(20, 0) == 101
+        assert synced.frame_for(20, 1) == 206
+
+    def test_explicit_sync_mapping_survives_csv_round_trip(self, tmp_path: Path):
+        """Writing a loaded audio-sync CSV does not drop explicit sync groups."""
+        pd.DataFrame(
+            [
+                {"sync_index": 10, "cam_id": 0, "frame_index": 100, "frame_time": 0.0},
+                {"sync_index": 10, "cam_id": 1, "frame_index": 205, "frame_time": 0.0},
+                {"sync_index": 20, "cam_id": 0, "frame_index": 101, "frame_time": 1 / 30},
+                {"sync_index": 20, "cam_id": 1, "frame_index": 206, "frame_time": 1 / 30},
+            ]
+        ).to_csv(tmp_path / "timestamps.csv", index=False)
+
+        synced = SynchronizedTimestamps.from_csv(tmp_path)
+        round_trip_path = tmp_path / "round_trip.csv"
+        synced.to_csv(round_trip_path)
+        round_tripped = SynchronizedTimestamps.from_csv_path(round_trip_path)
+
+        assert round_tripped.sync_indices == [10, 20]
+        assert round_tripped.frame_for(10, 0) == 100
+        assert round_tripped.frame_for(10, 1) == 205
+        assert round_tripped.frame_for(20, 0) == 101
+        assert round_tripped.frame_for(20, 1) == 206
+
     def test_frame_for_returns_frame_index(self):
         """frame_for returns a non-None int for a known sync_index and cam_id."""
         synced = SynchronizedTimestamps.from_csv(EXTRINSIC_DIR)

@@ -27,6 +27,7 @@ from caliscope.core.process_synchronized_recording import (
     get_initial_thumbnails,
     process_synchronized_recording,
 )
+from caliscope.recording.audio_sync import RecordingSyncInfo, load_sync_summary, synchronize_recording_timeline
 from caliscope.recording.synchronized_timestamps import SynchronizedTimestamps
 from caliscope.task_manager.cancellation import CancellationToken
 from caliscope.task_manager.task_handle import TaskHandle
@@ -84,6 +85,10 @@ class MultiCameraProcessingPresenter(QObject):
     # Completion signals
     processing_complete = Signal(object, object, object)  # (ImagePoints, ExtrinsicCoverageReport, Tracker)
     processing_failed = Signal(str)  # error message
+    sync_started = Signal()
+    sync_complete = Signal(object)  # RecordingSyncInfo
+    sync_failed = Signal(str)
+    sync_cancelled = Signal()
 
     # Rotation signals
     rotation_changed = Signal(int, int)  # (cam_id, rotation_count)
@@ -116,8 +121,11 @@ class MultiCameraProcessingPresenter(QObject):
 
         # Processing state (managed internally)
         self._task_handle: TaskHandle | None = None
+        self._sync_task_handle: TaskHandle | None = None
         self._result: ImagePoints | None = None
         self._coverage_report: ExtrinsicCoverageReport | None = None
+        self._sync_summary: RecordingSyncInfo | None = None
+        self._sync_started_at: float | None = None
 
         # Thumbnail state
         self._thumbnails: dict[int, NDArray[np.uint8]] = {}
@@ -150,14 +158,20 @@ class MultiCameraProcessingPresenter(QObject):
             TaskState.RUNNING,
         )
 
+    def _is_sync_active(self) -> bool:
+        return self._sync_task_handle is not None and self._sync_task_handle.state in (
+            TaskState.PENDING,
+            TaskState.RUNNING,
+        )
+
     @property
     def state(self) -> MultiCameraProcessingState:
         """Compute current state from internal reality - never stale."""
+        if self._is_task_active() or self._is_sync_active():
+            return MultiCameraProcessingState.PROCESSING
+
         if self._result is not None:
             return MultiCameraProcessingState.COMPLETE
-
-        if self._is_task_active():
-            return MultiCameraProcessingState.PROCESSING
 
         if self._recording_dir is None or not self._cameras:
             return MultiCameraProcessingState.UNCONFIGURED
@@ -189,6 +203,11 @@ class MultiCameraProcessingPresenter(QObject):
         """Current thumbnails by cam_id (copy)."""
         return dict(self._thumbnails)
 
+    @property
+    def sync_summary(self) -> RecordingSyncInfo | None:
+        """Current audio timeline synchronization summary, if available."""
+        return self._sync_summary
+
     # -------------------------------------------------------------------------
     # Configuration Methods
     # -------------------------------------------------------------------------
@@ -206,6 +225,7 @@ class MultiCameraProcessingPresenter(QObject):
             return
 
         self._recording_dir = path
+        self._sync_summary = load_sync_summary(path)
         self._reset_results()
         self._load_initial_thumbnails()
         self._emit_state_changed()
@@ -361,6 +381,37 @@ class MultiCameraProcessingPresenter(QObject):
         if self._is_task_active() and self._task_handle is not None:
             logger.info("Cancelling multi-camera processing")
             self._task_handle.cancel()
+        if self._is_sync_active() and self._sync_task_handle is not None:
+            logger.info("Cancelling audio timeline sync")
+            self._sync_task_handle.cancel()
+
+    def synchronize_timeline(self) -> None:
+        """Audio-sync recording videos and write timestamps.csv for processing."""
+        if self._recording_dir is None:
+            self.sync_failed.emit("No recording directory configured")
+            return
+        if not self._cameras:
+            self.sync_failed.emit("No cameras configured")
+            return
+        if self.state == MultiCameraProcessingState.PROCESSING:
+            self.sync_failed.emit("Cannot synchronize while another task is running")
+            return
+
+        recording_dir = self._recording_dir
+        cam_ids = sorted(self._cameras.keys())
+        self._sync_started_at = time.time()
+
+        def worker(token: CancellationToken, _handle: TaskHandle) -> RecordingSyncInfo:
+            return synchronize_recording_timeline(recording_dir, cam_ids, is_cancelled=lambda: token.is_cancelled)
+
+        self._sync_task_handle = self._task_manager.submit(worker, name="Audio timeline sync", auto_start=False)
+        self._sync_task_handle.completed.connect(self._on_sync_complete, Qt.ConnectionType.QueuedConnection)
+        self._sync_task_handle.failed.connect(self._on_sync_failed, Qt.ConnectionType.QueuedConnection)
+        self._sync_task_handle.cancelled.connect(self._on_sync_cancelled, Qt.ConnectionType.QueuedConnection)
+        self._task_manager.start_task(self._sync_task_handle.task_id)
+
+        self.sync_started.emit()
+        self._emit_state_changed()
 
     def reset(self) -> None:
         """Reset to READY state, clearing results.
@@ -402,6 +453,8 @@ class MultiCameraProcessingPresenter(QObject):
         """Clean up resources. Call before discarding presenter."""
         if self._is_task_active() and self._task_handle is not None:
             self._task_handle.cancel()
+        if self._is_sync_active() and self._sync_task_handle is not None:
+            self._sync_task_handle.cancel()
 
     # -------------------------------------------------------------------------
     # Private: Callbacks
@@ -502,6 +555,42 @@ class MultiCameraProcessingPresenter(QObject):
         logger.info("Multi-camera processing cancelled")
         self._emit_state_changed()
 
+    def _on_sync_complete(self, summary: RecordingSyncInfo) -> None:
+        """Handle successful audio timeline synchronization."""
+        logger.info(f"Audio timeline sync complete: {summary.common_duration_seconds:.3f}s overlap")
+        self._sync_summary = summary
+        self._sync_task_handle = None
+        self._sync_started_at = None
+        self._reset_results()
+        self.sync_complete.emit(summary)
+        self._emit_state_changed()
+
+    def _on_sync_failed(self, exc_type: str, message: str) -> None:
+        """Handle audio timeline synchronization failure."""
+        logger.error(f"Audio timeline sync failed: {exc_type}: {message}")
+        self._sync_task_handle = None
+        self._sync_started_at = None
+        self.sync_failed.emit(f"{exc_type}: {message}")
+        self._emit_state_changed()
+
+    def _on_sync_cancelled(self) -> None:
+        """Handle audio timeline synchronization cancellation."""
+        logger.info("Audio timeline sync cancelled")
+        self._sync_task_handle = None
+
+        # If cancellation landed after metadata was written, treat it as complete
+        # so the coordinator invalidates stale extrinsics and the GUI shows truth.
+        summary = self._load_new_sync_summary()
+        self._sync_started_at = None
+        if summary is not None:
+            self._sync_summary = summary
+            self._reset_results()
+            self.sync_complete.emit(summary)
+        else:
+            self.sync_cancelled.emit()
+
+        self._emit_state_changed()
+
     # -------------------------------------------------------------------------
     # Private: Helpers
     # -------------------------------------------------------------------------
@@ -516,6 +605,20 @@ class MultiCameraProcessingPresenter(QObject):
         self._coverage_matrix = None
         self._coverage_cam_ids = []
         self._coverage_cam_id_to_index = {}
+
+    def _load_new_sync_summary(self) -> RecordingSyncInfo | None:
+        if self._recording_dir is None or self._sync_started_at is None:
+            return None
+
+        summary = load_sync_summary(self._recording_dir)
+        if summary is None:
+            return None
+
+        summary_path = Path(summary.summary_path)
+        if not summary_path.exists() or summary_path.stat().st_mtime < self._sync_started_at:
+            return None
+
+        return summary
 
     def _emit_state_changed(self) -> None:
         """Emit state_changed signal with current computed state."""

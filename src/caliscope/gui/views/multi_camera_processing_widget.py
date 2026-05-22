@@ -15,6 +15,8 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QMessageBox,
+    QPlainTextEdit,
     QProgressBar,
     QPushButton,
     QScrollArea,
@@ -37,6 +39,7 @@ if TYPE_CHECKING:
         MultiCameraProcessingState,
     )
     from caliscope.packets import PointPacket
+    from caliscope.recording.audio_sync import RecordingSyncInfo
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +73,8 @@ class MultiCameraProcessingWidget(QWidget):
 
         self._setup_ui()
         self._connect_signals()
+        if presenter.sync_summary is not None:
+            self._sync_summary.setPlainText(self._format_sync_summary(presenter.sync_summary))
         self._update_ui_for_state(presenter.state)
 
     def _setup_ui(self) -> None:
@@ -147,6 +152,26 @@ class MultiCameraProcessingWidget(QWidget):
         progress_layout.addWidget(self._progress_label)
 
         controls_layout.addWidget(self._progress_container)
+
+        controls_layout.addSpacing(12)
+
+        self._sync_group = QGroupBox("Timeline Sync")
+        sync_layout = QVBoxLayout(self._sync_group)
+        sync_layout.setContentsMargins(8, 8, 8, 8)
+        self._sync_btn = QPushButton("Audio Sync Videos")
+        self._sync_btn.setToolTip(
+            "Align videos by audio, write timestamps.csv, and restrict processing to the shared time window."
+        )
+        self._sync_btn.clicked.connect(self._on_sync_clicked)
+        sync_layout.addWidget(self._sync_btn)
+
+        self._sync_summary = QPlainTextEdit()
+        self._sync_summary.setReadOnly(True)
+        self._sync_summary.setMaximumHeight(150)
+        self._sync_summary.setPlainText("No audio sync yet. Processing will infer timestamps from video metadata.")
+        sync_layout.addWidget(self._sync_summary)
+        controls_layout.addWidget(self._sync_group)
+
         controls_layout.addStretch()
 
         bottom_section.addWidget(controls_container, stretch=1)
@@ -299,6 +324,10 @@ class MultiCameraProcessingWidget(QWidget):
         self._presenter.thumbnail_updated.connect(self._on_thumbnail_updated)
         self._presenter.processing_complete.connect(self._on_processing_complete)
         self._presenter.processing_failed.connect(self._on_processing_failed)
+        self._presenter.sync_started.connect(self._on_sync_started)
+        self._presenter.sync_complete.connect(self._on_sync_complete)
+        self._presenter.sync_failed.connect(self._on_sync_failed)
+        self._presenter.sync_cancelled.connect(self._on_sync_cancelled)
         self._presenter.coverage_updated.connect(
             self._on_coverage_updated,
             Qt.ConnectionType.QueuedConnection,
@@ -318,6 +347,7 @@ class MultiCameraProcessingWidget(QWidget):
             self._progress_container.hide()
             self._set_rotation_enabled(False)
             self._subsample_spin.setEnabled(False)
+            self._sync_btn.setEnabled(False)
             # Show placeholder, hide content
             self._coverage_placeholder.show()
             self._coverage_content.hide()
@@ -328,6 +358,7 @@ class MultiCameraProcessingWidget(QWidget):
             self._progress_container.hide()
             self._set_rotation_enabled(True)
             self._subsample_spin.setEnabled(True)
+            self._sync_btn.setEnabled(True)
             # Show placeholder, hide content
             self._coverage_placeholder.show()
             self._coverage_content.hide()
@@ -340,6 +371,7 @@ class MultiCameraProcessingWidget(QWidget):
             self._progress_label.setText("Starting...")
             self._set_rotation_enabled(False)
             self._subsample_spin.setEnabled(False)
+            self._sync_btn.setEnabled(False)
             # Show coverage content for live heatmap updates
             self._coverage_placeholder.hide()
             self._coverage_content.show()
@@ -351,6 +383,7 @@ class MultiCameraProcessingWidget(QWidget):
             self._progress_label.setText("Processing complete")
             self._set_rotation_enabled(True)
             self._subsample_spin.setEnabled(True)
+            self._sync_btn.setEnabled(True)
             # Show content, hide placeholder
             self._coverage_placeholder.hide()
             self._coverage_content.show()
@@ -437,6 +470,35 @@ class MultiCameraProcessingWidget(QWidget):
             self._presenter.cancel_processing()
         elif state == MultiCameraProcessingState.COMPLETE:
             self._presenter.reset()
+
+    def _on_sync_clicked(self) -> None:
+        self._presenter.synchronize_timeline()
+
+    def _on_sync_started(self) -> None:
+        self._sync_summary.setPlainText("Audio sync running... extracting audio and matching offsets.")
+
+    def _on_sync_complete(self, summary: "RecordingSyncInfo") -> None:
+        self._sync_summary.setPlainText(self._format_sync_summary(summary))
+
+    def _on_sync_failed(self, message: str) -> None:
+        self._sync_summary.setPlainText(f"Audio sync failed:\n{message}")
+        QMessageBox.warning(self, "Audio Sync Failed", message)
+
+    def _on_sync_cancelled(self) -> None:
+        self._sync_summary.setPlainText("Audio sync cancelled. Existing timeline metadata was not changed.")
+
+    def _format_sync_summary(self, summary: "RecordingSyncInfo") -> str:
+        lines = [
+            f"Overlap: {summary.common_duration_seconds:.3f}s",
+            f"Reference: cam {summary.reference_cam_id}",
+            "cam | offset(s) | start-end frames | duration",
+        ]
+        for cam_id, info in sorted(summary.cameras.items()):
+            lines.append(
+                f"{cam_id:>3} | {info.offset_seconds:>+8.3f} | "
+                f"{info.start_frame}-{info.end_frame} | {info.synced_duration_seconds:.3f}s"
+            )
+        return "\n".join(lines)
 
     def _on_rotate_requested(self, cam_id: int, direction: int) -> None:
         """Handle rotation request from camera card.

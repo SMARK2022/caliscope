@@ -189,7 +189,7 @@ class WorkspaceCoordinator(QObject):
         Requires: 2D extraction complete AND intrinsics calibrated.
         This is where extrinsic calibration happens.
         """
-        extraction_complete = self.extrinsic_image_points_path.exists()
+        extraction_complete = self._extrinsic_image_points_current()
         return extraction_complete and self.camera_array.all_intrinsics_calibrated()
 
     @property
@@ -277,7 +277,7 @@ class WorkspaceCoordinator(QObject):
         logger.info(f"All extrinsics calculated: {cameras_good}")
 
         # Check for calibration data in CaptureVolume system
-        point_estimates_good = self.capture_volume_repository.camera_array_path.exists()
+        point_estimates_good = self._capture_volume_source_data_is_current()
         logger.info(f"Point estimates available: {point_estimates_good}")
 
         all_data_available = self.workspace_guide.all_extrinsic_mp4s_available()
@@ -288,6 +288,18 @@ class WorkspaceCoordinator(QObject):
     def recordings_available(self) -> bool:
         """Check if any valid recording directories exist."""
         return len(self.workspace_guide.valid_recording_dirs()) > 0
+
+    def _extrinsic_image_points_current(self) -> bool:
+        """True when extracted 2D points exist for the current extrinsic timeline."""
+        image_points_path = self.extrinsic_image_points_path
+        if not image_points_path.exists():
+            return False
+
+        timestamps_path = self.workspace_guide.extrinsic_dir / "timestamps.csv"
+        if timestamps_path.exists() and timestamps_path.stat().st_mtime > image_points_path.stat().st_mtime:
+            return False
+
+        return True
 
     def get_workflow_status(self) -> WorkflowStatus:
         """Compute current workflow status from ground truth.
@@ -310,7 +322,7 @@ class WorkspaceCoordinator(QObject):
         cameras_needing = [cam_id for cam_id, cam in self.camera_array.cameras.items() if cam.matrix is None]
 
         # 2D extraction complete check
-        extraction_complete = self.extrinsic_image_points_path.exists()
+        extraction_complete = self._extrinsic_image_points_current()
 
         return WorkflowStatus(
             camera_count=camera_count,
@@ -414,10 +426,10 @@ class WorkspaceCoordinator(QObject):
         Load camera array from persistence and detect new cameras from video files.
 
         Any cameras discovered in the intrinsic directory that aren't in the
-        saved array will be added automatically. Existing cameras are checked
-        against the intrinsic video metadata so stale resolutions cannot poison
-        calibration. Also loads any persisted intrinsic calibration reports for
-        overlay restoration.
+        saved array will be added automatically. Existing cameras are not size-
+        checked here; that happens lazily when the user opens a specific
+        intrinsic video. Also loads any persisted intrinsic calibration reports
+        for overlay restoration.
         """
         self.camera_array = self.camera_repository.load()
 
@@ -427,8 +439,6 @@ class WorkspaceCoordinator(QObject):
         for cam_id in all_cam_ids:
             if cam_id not in self.camera_array.cameras:
                 self._add_camera_from_source(cam_id)
-            else:
-                self._sync_camera_size_from_intrinsic_video(cam_id)
 
         # Load any persisted intrinsic reports for overlay restoration
         self._intrinsic_reports = self.intrinsic_report_repository.load_all()
@@ -649,7 +659,11 @@ class WorkspaceCoordinator(QObject):
             for cam_id, camera in camera_array.cameras.items():
                 if camera.serial_number is None or camera.matrix is None or camera.distortions is None:
                     continue
-                profiles[camera.serial_number] = self._profile_from_camera_data(camera, source=str(path), source_cam_id=cam_id)
+                profiles[camera.serial_number] = self._profile_from_camera_data(
+                    camera,
+                    source=str(path),
+                    source_cam_id=cam_id,
+                )
             return profiles
 
         raw_profiles = data.get("profiles", data)
@@ -817,6 +831,7 @@ class WorkspaceCoordinator(QObject):
 
         # Wire signal directly - no passthrough needed
         presenter.processing_complete.connect(lambda ip, _cr, t: self.persist_extrinsic_image_points(ip, t.name))
+        presenter.sync_complete.connect(lambda _summary: self.invalidate_extrinsic_timeline())
 
         return presenter
 
@@ -876,6 +891,12 @@ class WorkspaceCoordinator(QObject):
         self._clear_extrinsics("Extrinsic image points changed")
         self.camera_repository.save(self.camera_array)
         logger.info(f"Persisted extrinsic image points: {len(image_points.df)} observations to {output_path}")
+        self.status_changed.emit()
+
+    def invalidate_extrinsic_timeline(self) -> None:
+        """Mark previous extrinsic calibration results stale after timeline changes."""
+        self._clear_extrinsics("Extrinsic timeline changed")
+        self.camera_repository.save(self.camera_array)
         self.status_changed.emit()
 
     def persist_camera_rotation(self, cam_id: int, rotation_count: int) -> None:
@@ -1000,6 +1021,9 @@ class WorkspaceCoordinator(QObject):
             return False
 
         source_mtime = self.extrinsic_image_points_path.stat().st_mtime
+        timestamps_path = self.workspace_guide.extrinsic_dir / "timestamps.csv"
+        if timestamps_path.exists():
+            source_mtime = max(source_mtime, timestamps_path.stat().st_mtime)
         snapshot_paths = (
             self.capture_volume_repository.camera_array_path,
             self.capture_volume_repository.image_points_path,

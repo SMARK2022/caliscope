@@ -46,6 +46,7 @@ class SynchronizedTimestamps:
     """
 
     _camera_timestamps: Mapping[int, FrameTimestamps]
+    _explicit_sync_mapping: Mapping[int, Mapping[int, int | None]] | None = None
 
     # -------------------------------------------------------------------------
     # Query methods (public API)
@@ -74,12 +75,28 @@ class SynchronizedTimestamps:
         return self._camera_timestamps[cam_id]
 
     def to_csv(self, path: Path) -> None:
-        """Write all camera timestamps to CSV (cam_id, frame_time format)."""
+        """Write camera timestamps, preserving explicit sync groups when present."""
         rows: list[dict] = []
+        if self._explicit_sync_mapping is not None:
+            for sync_index in self.sync_indices:
+                for cam_id, frame_index in sorted(self._cache[sync_index].items()):
+                    if frame_index is None:
+                        continue
+                    rows.append(
+                        {
+                            "sync_index": sync_index,
+                            "cam_id": cam_id,
+                            "frame_index": frame_index,
+                            "frame_time": self.time_for(cam_id, frame_index),
+                        }
+                    )
+            pd.DataFrame(rows).to_csv(path, index=False)
+            return
+
         for cam_id in self.cam_ids:
             ft = self._camera_timestamps[cam_id]
             for frame_index in sorted(ft.frame_times.keys()):
-                rows.append({"cam_id": cam_id, "frame_time": ft.frame_times[frame_index]})
+                rows.append({"cam_id": cam_id, "frame_index": frame_index, "frame_time": ft.frame_times[frame_index]})
         pd.DataFrame(rows).to_csv(path, index=False)
 
     # -------------------------------------------------------------------------
@@ -89,6 +106,11 @@ class SynchronizedTimestamps:
     @cached_property
     def _cache(self) -> _SyncMapping:
         """Sync mapping computed from camera timestamps. Private."""
+        if self._explicit_sync_mapping is not None:
+            return {
+                int(sync_index): {int(cam_id): frame_index for cam_id, frame_index in mapping.items()}
+                for sync_index, mapping in self._explicit_sync_mapping.items()
+            }
         return self._compute_sync_mapping()
 
     def _compute_sync_mapping(self) -> _SyncMapping:
@@ -98,8 +120,8 @@ class SynchronizedTimestamps:
         belongs to each sync group, handling dropped frames and slight
         timing differences.
         """
-        frames_by_cam: dict[int, list[float]] = {
-            cam_id: [ft.frame_times[i] for i in sorted(ft.frame_times.keys())]
+        frames_by_cam: dict[int, list[tuple[int, float]]] = {
+            cam_id: [(i, ft.frame_times[i]) for i in sorted(ft.frame_times.keys())]
             for cam_id, ft in self._camera_timestamps.items()
         }
 
@@ -113,7 +135,7 @@ class SynchronizedTimestamps:
             candidates: dict[int, float] = {}
             for cam_id in cam_ids:
                 if cursors[cam_id] < len(frames_by_cam[cam_id]):
-                    candidates[cam_id] = frames_by_cam[cam_id][cursors[cam_id]]
+                    candidates[cam_id] = frames_by_cam[cam_id][cursors[cam_id]][1]
 
             if not candidates:
                 break
@@ -132,7 +154,7 @@ class SynchronizedTimestamps:
                     continue
 
                 frame_time = candidates[cam_id]
-                current_frame_index = cursors[cam_id]
+                current_frame_index = frames_by_cam[cam_id][cursors[cam_id]][0]
 
                 if frame_time > earliest_next[cam_id]:
                     assigned[cam_id] = None
@@ -177,10 +199,8 @@ class SynchronizedTimestamps:
         """Load from an explicit timestamps CSV path.
 
         Reads the CSV, groups rows by cam_id, and constructs a FrameTimestamps
-        per camera. The sync_index column is ignored if present -- the sync
-        mapping is always recomputed from timestamps. Use this when the CSV
-        lives outside a canonical recording directory (e.g., scripting API
-        with user-supplied paths).
+        per camera. When both sync_index and frame_index are present, preserves
+        that explicit mapping instead of recomputing from nearest timestamps.
         """
         df = pd.read_csv(csv_path)
 
@@ -188,11 +208,28 @@ class SynchronizedTimestamps:
         for cam_key, group in df.groupby("cam_id"):
             cam_id = int(cam_key)  # type: ignore[arg-type]  # pandas groupby key is numpy.int64
             sorted_group = group.sort_values("frame_time").reset_index(drop=True)
-            frame_times = {i: float(t) for i, t in enumerate(sorted_group["frame_time"])}
+            if "frame_index" in sorted_group.columns:
+                frame_times = {
+                    int(row.frame_index): float(row.frame_time) for row in sorted_group.itertuples(index=False)
+                }
+            else:
+                frame_times = {i: float(t) for i, t in enumerate(sorted_group["frame_time"])}
             camera_timestamps[cam_id] = FrameTimestamps(MappingProxyType(frame_times))
 
+        explicit_mapping = None
+        if {"sync_index", "frame_index"}.issubset(df.columns):
+            cam_ids = sorted(camera_timestamps.keys())
+            explicit: dict[int, dict[int, int | None]] = {}
+            for sync_key, group in df.groupby("sync_index"):
+                sync_index = int(sync_key)  # type: ignore[arg-type]
+                mapping = {cam_id: None for cam_id in cam_ids}
+                for row in group.itertuples(index=False):
+                    mapping[int(row.cam_id)] = int(row.frame_index)
+                explicit[sync_index] = mapping
+            explicit_mapping = MappingProxyType({k: MappingProxyType(v) for k, v in explicit.items()})
+
         logger.debug(f"Loaded timestamps from CSV for {len(camera_timestamps)} cameras")
-        return cls(MappingProxyType(camera_timestamps))
+        return cls(MappingProxyType(camera_timestamps), explicit_mapping)
 
     @classmethod
     def from_video_paths(cls, videos: Mapping[int, Path]) -> Self:
@@ -329,7 +366,11 @@ class SynchronizedTimestamps:
 # -------------------------------------------------------------------------
 
 
-def _earliest_next_frame(cam_id: int, cursors: dict[int, int], frames_by_cam: dict[int, list[float]]) -> float:
+def _earliest_next_frame(
+    cam_id: int,
+    cursors: dict[int, int],
+    frames_by_cam: dict[int, list[tuple[int, float]]],
+) -> float:
     """Get minimum frame_time of NEXT frames from OTHER cameras."""
     times = []
     for c in cursors:
@@ -337,11 +378,15 @@ def _earliest_next_frame(cam_id: int, cursors: dict[int, int], frames_by_cam: di
             continue
         next_index = cursors[c] + 1
         if next_index < len(frames_by_cam[c]):
-            times.append(frames_by_cam[c][next_index])
+            times.append(frames_by_cam[c][next_index][1])
     return min(times) if times else float("inf")
 
 
-def _latest_current_frame(cam_id: int, cursors: dict[int, int], frames_by_cam: dict[int, list[float]]) -> float:
+def _latest_current_frame(
+    cam_id: int,
+    cursors: dict[int, int],
+    frames_by_cam: dict[int, list[tuple[int, float]]],
+) -> float:
     """Get maximum frame_time of CURRENT frames from OTHER cameras."""
     times = []
     for c in cursors:
@@ -349,5 +394,5 @@ def _latest_current_frame(cam_id: int, cursors: dict[int, int], frames_by_cam: d
             continue
         current_index = cursors[c]
         if current_index < len(frames_by_cam[c]):
-            times.append(frames_by_cam[c][current_index])
+            times.append(frames_by_cam[c][current_index][1])
     return max(times) if times else float("-inf")
