@@ -476,8 +476,8 @@ def compute_relative_poses(
         common_sync = sync_a.intersection(sync_b)
 
         for sync_index in common_sync:
-            R_a, t_a, _ = camera_to_object_poses[(cam_id_a, sync_index)]
-            R_b, t_b, _ = camera_to_object_poses[(cam_id_b, sync_index)]
+            R_a, t_a, error_a = camera_to_object_poses[(cam_id_a, sync_index)]
+            R_b, t_b, error_b = camera_to_object_poses[(cam_id_b, sync_index)]
 
             # Compute relative transformation: T_B_A = T_B_obj @ inv(T_A_obj)
             R_a_inv = R_a.T
@@ -490,7 +490,7 @@ def compute_relative_poses(
             relative_poses[(pair_key, sync_index)] = StereoPair(
                 primary_cam_id=cam_id_a,
                 secondary_cam_id=cam_id_b,
-                error_score=float("nan"),  # Placeholder until RMSE calculation
+                error_score=float(error_a + error_b),
                 translation=t_rel,
                 rotation=R_rel,
             )
@@ -530,10 +530,12 @@ def aggregate_poses(filtered_poses: dict[tuple[int, int], list[StereoPair]]) -> 
         translations = [sp.translation for sp in stereo_pairs]
         avg_t = np.mean(translations, axis=0)
 
+        finite_errors = [sp.error_score for sp in stereo_pairs if np.isfinite(sp.error_score)]
+        fallback_error = float(np.mean(finite_errors)) if finite_errors else float("nan")
         aggregated[pair] = StereoPair(
             primary_cam_id=pair[0],
             secondary_cam_id=pair[1],
-            error_score=float("nan"),  # Placeholder until RMSE calculation
+            error_score=fallback_error,
             rotation=avg_R,
             translation=avg_t,
         )
@@ -562,8 +564,15 @@ def estimate_pnp_paired_pose_network(
     for pair, stereo_pair in aggregated_pairs_wo_rmse.items():
         rmse = calculate_stereo_rmse_for_pair(stereo_pair, camera_array, common_observations)
         if rmse is None:
-            logger.warning(f"Could not compute RMSE for pair {pair}, skipping")
-            continue
+            if np.isfinite(stereo_pair.error_score):
+                rmse = stereo_pair.error_score
+                logger.warning(
+                    f"Could not compute stereo RMSE for pair {pair}; "
+                    f"using PnP reprojection fallback score {rmse:.6f}"
+                )
+            else:
+                logger.warning(f"Could not compute RMSE for pair {pair}, skipping")
+                continue
 
         # Create new StereoPair with RMSE populated
         pairs_with_rmse[pair] = StereoPair(

@@ -42,6 +42,7 @@ def process_synchronized_recording(
     *,
     subsample: int = 1,
     parallel: bool = True,
+    max_workers: int | None = None,
     on_progress: Callable[[int, int], None] | None = None,
     on_frame_data: Callable[[int, dict[int, FrameData]], None] | None = None,
     token: CancellationToken | None = None,
@@ -60,6 +61,8 @@ def process_synchronized_recording(
         parallel: Process cameras concurrently (True) or serially (False).
             Uses ThreadPoolExecutor when True and multiple cameras present.
             Set to False as fallback if threading issues are discovered.
+        max_workers: Optional cap on per-sync-index camera worker threads.
+            Values above the number of active cameras are bounded to the camera count.
         on_progress: Called with (current, total) during processing
         on_frame_data: Called with (sync_index, {cam_id: FrameData}) for live display
         token: Cancellation token for graceful shutdown
@@ -75,14 +78,14 @@ def process_synchronized_recording(
         f"(subsample={subsample}, total available={len(synced_timestamps.sync_indices)})"
     )
 
-    frame_sources = _create_frame_sources(recording_dir, cameras)
+    frame_sources = _create_frame_sources(recording_dir, cameras, max_workers=max_workers)
     point_rows: list[dict] = []
 
     try:
         use_pool = parallel and len(frame_sources) > 1
 
         if use_pool:
-            camera_pool = ThreadPoolExecutor(max_workers=len(frame_sources))
+            camera_pool = ThreadPoolExecutor(max_workers=_bounded_worker_count(len(frame_sources), max_workers))
         else:
             camera_pool = None
 
@@ -204,7 +207,12 @@ def get_initial_thumbnails(
     return thumbnails
 
 
-def _create_frame_sources(recording_dir: Path, cameras: dict[int, CameraData]) -> dict[int, FrameSource]:
+def _create_frame_sources(
+    recording_dir: Path,
+    cameras: dict[int, CameraData],
+    *,
+    max_workers: int | None = None,
+) -> dict[int, FrameSource]:
     """Create FrameSource for each camera cam_id.
 
     Each FrameSource runs a keyframe scan on init (I/O-bound), so cameras
@@ -223,10 +231,18 @@ def _create_frame_sources(recording_dir: Path, cameras: dict[int, CameraData]) -
 
     cam_ids = list(cameras.keys())
 
-    with ThreadPoolExecutor(max_workers=len(cam_ids)) as pool:
+    with ThreadPoolExecutor(max_workers=_bounded_worker_count(len(cam_ids), max_workers)) as pool:
         results = pool.map(_init_one, cam_ids)
 
     return {cam_id: source for cam_id, source in results if source is not None}
+
+
+def _bounded_worker_count(item_count: int, max_workers: int | None) -> int:
+    if item_count < 1:
+        return 1
+    if max_workers is None:
+        return item_count
+    return max(1, min(item_count, max_workers))
 
 
 def _accumulate_points(
