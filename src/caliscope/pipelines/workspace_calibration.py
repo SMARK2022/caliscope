@@ -1,15 +1,19 @@
-"""Automated non-GUI calibration pipeline for a Caliscope workspace.
+"""Caliscope 工作区的非 GUI 自动标定管线。
 
-Run with::
+该模块刻意只做“工作流编排”，不把相机模型、ChArUco 检测、BA 优化等核心算法
+复制到脚本里。这样既能在集群/远程服务器上运行，又能复用 GUI 已验证过的底层
+能力：发现相机、同步外参视频、复用/适配内参、提取 ChArUco 点、初始化外参图、
+两轮 bundle adjustment、保存 Caliscope 和 aniposelib 两种输出。
+
+命令行示例::
 
     python -m caliscope.pipelines.workspace_calibration \
         --workspace /path/to/workspace \
         --intrinsics-library /path/to/intrinsics_library.toml
 
-The pipeline mirrors the GUI workflow without importing Qt: discover cameras,
-reuse/adapt intrinsics, synchronize the extrinsic recording by audio, extract
-Charuco points, run bootstrap plus two-stage bundle adjustment, and persist the
-resulting camera array/capture volume.
+默认行为强调可恢复性和安全性：已有同步结果和本管线生成的 image_points manifest
+会被复用；外参图不完整时默认失败，只有显式传入 ``--allow-partial-extrinsics`` 才会
+保存部分相机外参。
 """
 
 from __future__ import annotations
@@ -45,6 +49,37 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class WorkspaceCalibrationConfig:
+    """非 GUI 标定管线的全部运行参数。
+
+    这个 dataclass 是 CLI 和 Python API 之间的稳定边界。字段尽量保持扁平，避免
+    为了配置再引入多层对象；这样在 VS Code、notebook 或命令行里调用时都容易看懂。
+
+    Attributes:
+        workspace: Caliscope 工作区根目录。
+        intrinsics_library: 内参库 TOML、内参库目录或可读取的 Caliscope 工作区。
+        extrinsic_frame_step: 外参同步视频按多少 sync index 抽帧检测。
+        intrinsic_frame_step: 内参缺失时，内参视频按多少帧抽样检测。
+        resume: 是否默认复用已完成且有效的阶段产物。
+        reuse_existing_sync: 即使关闭 resume，也允许复用已有同步文件。
+        reuse_image_points: 允许复用没有 manifest 的旧 image_points.csv。
+        force_sync: 强制重做音频同步。
+        force_image_points: 强制重做外参 ChArUco 点检测。
+        force_capture_volume: 强制重做外参 bootstrap 和 BA。
+        source_cam_id_fallback: 缺少序列号时，用内参库 source_cam_id 匹配相机。
+        read_metadata: 是否读取 GoPro 大文件元数据；默认关闭以避免启动阶段卡顿。
+        calibrate_missing: 内参库无法匹配时是否用内参视频补标定。
+        parallel: 是否并行处理每个 sync index 上的多相机帧。
+        workers: 相机处理线程上限；None 表示最多使用相机数。
+        opencv_threads: OpenCV 每进程内部线程数；None 表示自动按 CPU/worker 均分。
+        show_progress: 是否显示 tqdm 进度条。
+        filter_percentile: 第一轮 BA 后剔除的最差重投影误差百分比。
+        max_nfev: 每轮 SciPy least_squares 最大函数评估次数。
+        scipy_verbose: SciPy 优化器日志级别。
+        align_to_object: 是否把最终坐标系对齐到某一帧 ChArUco 板。
+        plan_only: 只打印复用/重算计划，不写入标定结果。
+        allow_partial_extrinsics: 允许外参图不完整时继续保存 partial 结果。
+    """
+
     workspace: Path
     intrinsics_library: Path
     extrinsic_frame_step: int = 5
@@ -71,7 +106,23 @@ class WorkspaceCalibrationConfig:
 
 
 def run_workspace_calibration(config: WorkspaceCalibrationConfig) -> dict[str, Any]:
-    """Run the full non-GUI workspace calibration pipeline."""
+    """执行完整的非 GUI 工作区标定流程。
+
+    流程顺序保持和 GUI 一致：先建立相机数组并导入内参，再同步外参视频时间线，
+    然后提取同步 ChArUco 点，最后进行外参初始化和两轮 BA。函数返回的字典会被
+    写入 ``calibration/extrinsic/capture_volume/calibration_report.toml``，也便于测试
+    或 notebook 调用时直接检查。
+
+    Args:
+        config: 管线运行配置，包含路径、复用策略、并行参数和 BA 参数。
+
+    Returns:
+        可 TOML 序列化的运行报告。plan_only=True 时只包含阶段计划，不会写结果。
+
+    Raises:
+        FileNotFoundError: 工作区、内参库或视频目录缺失。
+        ValueError: 配置无效、内参不完整或外参图无法连通所有相机。
+    """
     workspace = config.workspace.expanduser().resolve()
     intrinsics_library = config.intrinsics_library.expanduser().resolve()
     _validate_config(config, workspace, intrinsics_library)
@@ -254,6 +305,18 @@ def run_workspace_calibration(config: WorkspaceCalibrationConfig) -> dict[str, A
     return run_report
 
 def _validate_config(config: WorkspaceCalibrationConfig, workspace: Path, intrinsics_library: Path) -> None:
+    """校验路径和数值参数，尽早暴露配置错误。
+
+    Args:
+        config: 用户传入的运行配置。
+        workspace: 已展开和 resolve 后的工作区路径。
+        intrinsics_library: 已展开和 resolve 后的内参库路径。
+
+    Raises:
+        FileNotFoundError: 必要路径不存在。
+        ValueError: 抽帧步长、worker 数或优化参数不在合法范围内。
+    """
+
     if not workspace.exists():
         raise FileNotFoundError(f"Workspace not found: {workspace}")
     if not intrinsics_library.exists():
@@ -275,6 +338,20 @@ def _validate_config(config: WorkspaceCalibrationConfig, workspace: Path, intrin
 
 
 def _configure_runtime(config: WorkspaceCalibrationConfig, *, camera_count: int) -> dict[str, Any]:
+    """配置本进程的并行度，并记录 CPU/OpenCV/CUDA 运行时信息。
+
+    OpenCV 的 ChArUco 检测主要吃 CPU。并行处理 19 台相机时，如果每个 worker 都
+    使用 OpenCV 默认线程数，容易在集群节点上过度订阅 CPU。因此默认按
+    ``cpu_count / workers`` 给 OpenCV 分配内部线程数。
+
+    Args:
+        config: 运行配置。
+        camera_count: 当前工作区的相机数量。
+
+    Returns:
+        运行时信息字典，会写入标定报告。
+    """
+
     cpu_count = os.cpu_count() or 1
     workers = _resolve_workers(config, camera_count)
     if config.opencv_threads is not None:
@@ -321,6 +398,16 @@ def _configure_runtime(config: WorkspaceCalibrationConfig, *, camera_count: int)
 
 
 def _resolve_workers(config: WorkspaceCalibrationConfig, camera_count: int) -> int:
+    """计算实际用于多相机检测的 worker 数量。
+
+    Args:
+        config: 运行配置。
+        camera_count: 当前工作区相机数量。
+
+    Returns:
+        至少为 1，且不超过相机数量的 worker 数。
+    """
+
     if not config.parallel:
         return 1
     requested = config.workers if config.workers is not None else camera_count
@@ -328,6 +415,18 @@ def _resolve_workers(config: WorkspaceCalibrationConfig, camera_count: int) -> i
 
 
 def _discover_camera_videos(directory: Path) -> dict[int, Path]:
+    """扫描目录中的 ``cam_N.mp4`` 文件并按 cam_id 建立映射。
+
+    Args:
+        directory: 内参或外参视频目录。
+
+    Returns:
+        ``{cam_id: video_path}`` 字典。
+
+    Raises:
+        FileNotFoundError: 目录下没有任何符合命名规则的视频。
+    """
+
     videos: dict[int, Path] = {}
     for path in sorted(directory.glob("cam_*.mp4")):
         cam_id = _cam_id_from_name(path.stem)
@@ -339,6 +438,15 @@ def _discover_camera_videos(directory: Path) -> dict[int, Path]:
 
 
 def _cam_id_from_name(name: str) -> int | None:
+    """从 ``cam_N`` 文件名或标签中解析相机 ID。
+
+    Args:
+        name: 不带扩展名的文件名或 CSV 中的 camera 字段。
+
+    Returns:
+        解析成功时返回整数 cam_id，否则返回 None。
+    """
+
     if not name.startswith("cam_"):
         return None
     try:
@@ -348,6 +456,15 @@ def _cam_id_from_name(name: str) -> int | None:
 
 
 def _load_extrinsic_charuco(workspace: Path) -> Charuco:
+    """加载外参标定使用的 ChArUco 板配置。
+
+    Args:
+        workspace: Caliscope 工作区根目录。
+
+    Returns:
+        ChArUco target 对象；优先使用 extrinsic 配置，缺失时回退到 intrinsic 配置。
+    """
+
     targets_dir = workspace / "calibration" / "targets"
     extrinsic_path = targets_dir / "extrinsic_charuco.toml"
     if not extrinsic_path.exists():
@@ -356,6 +473,15 @@ def _load_extrinsic_charuco(workspace: Path) -> Charuco:
 
 
 def _load_camera_name_mapping(workspace: Path) -> dict[int, dict[str, str]]:
+    """读取工作区里的相机文件名映射表。
+
+    Args:
+        workspace: Caliscope 工作区根目录。
+
+    Returns:
+        以 cam_id 为 key 的 CSV 行数据；文件不存在时返回空字典。
+    """
+
     path = workspace / "camera_name_mapping.csv"
     if not path.exists():
         return {}
@@ -377,6 +503,22 @@ def _build_camera_array(
     read_metadata: bool,
     show_progress: bool,
 ) -> tuple[CameraArray, list[dict[str, Any]]]:
+    """根据视频元数据、旧 camera_array 和映射表构造当前相机数组。
+
+    这里有意不复用旧外参：每次运行都应由当前外参视频重新求解 pose，避免把旧结果
+    混入新的同步/检测产物。旧的 rotation_count、label、ignore 等展示/管理字段会保留。
+
+    Args:
+        workspace: 工作区根目录。
+        intrinsic_videos: 内参视频路径映射。
+        extrinsic_videos: 外参视频路径映射。
+        read_metadata: 是否尝试读取 GoPro 序列号和型号。
+        show_progress: 是否显示相机元数据读取进度。
+
+    Returns:
+        新的 CameraArray，以及可写入报告的 metadata 读取记录。
+    """
+
     mapping = _load_camera_name_mapping(workspace)
     existing = _load_existing_camera_array(workspace / "camera_array.toml")
     cameras: dict[int, CameraData] = {}
@@ -445,6 +587,15 @@ def _build_camera_array(
 
 
 def _load_existing_camera_array(path: Path) -> CameraArray | None:
+    """尝试读取已有 camera_array.toml，失败时退化为 None。
+
+    Args:
+        path: camera_array.toml 路径。
+
+    Returns:
+        读取成功时返回 CameraArray，否则返回 None。
+    """
+
     if not path.exists():
         return None
     try:
@@ -455,6 +606,17 @@ def _load_existing_camera_array(path: Path) -> CameraArray | None:
 
 
 def _metadata_source_path(workspace: Path, row: dict[str, str], fallback: Path) -> Path:
+    """选择读取 GoPro 元数据的源视频路径。
+
+    Args:
+        workspace: 工作区根目录。
+        row: camera_name_mapping.csv 中对应 cam_id 的行。
+        fallback: 映射表缺失或源视频不存在时使用的外参视频路径。
+
+    Returns:
+        优先返回原始视频路径，否则返回 fallback。
+    """
+
     raw = row.get("video_path")
     if raw:
         candidate = workspace / raw
@@ -464,6 +626,16 @@ def _metadata_source_path(workspace: Path, row: dict[str, str], fallback: Path) 
 
 
 def _workspace_relative(workspace: Path, path: Path) -> str:
+    """把路径尽量转换成相对工作区的字符串。
+
+    Args:
+        workspace: 工作区根目录。
+        path: 需要写入 TOML 的文件路径。
+
+    Returns:
+        能相对化时返回相对路径字符串，否则返回绝对路径字符串。
+    """
+
     try:
         return str(path.relative_to(workspace))
     except ValueError:
@@ -471,6 +643,15 @@ def _workspace_relative(workspace: Path, path: Path) -> str:
 
 
 def _load_intrinsics_profiles(library_path: Path) -> dict[str, dict[str, Any]]:
+    """加载内参 profile，兼容文件、目录和 Caliscope 工作区三种输入。
+
+    Args:
+        library_path: 内参库 TOML、包含 TOML 的目录，或含 camera_array.toml 的工作区。
+
+    Returns:
+        以 serial/profile key 为 key 的 profile 字典。
+    """
+
     if library_path.is_dir():
         workspace_camera_array = library_path / "camera_array.toml"
         if workspace_camera_array.exists():
@@ -485,6 +666,15 @@ def _load_intrinsics_profiles(library_path: Path) -> dict[str, dict[str, Any]]:
 
 
 def _load_intrinsics_profiles_from_file(path: Path) -> dict[str, dict[str, Any]]:
+    """从单个 TOML 文件读取内参 profile。
+
+    Args:
+        path: 内参库 TOML 或 camera_array.toml。
+
+    Returns:
+        过滤掉无 matrix/size/distortions 的有效 profile 字典。
+    """
+
     data = rtoml.load(path)
     if "cameras" in data:
         return _load_intrinsics_profiles_from_camera_array(path)
@@ -505,6 +695,15 @@ def _load_intrinsics_profiles_from_file(path: Path) -> dict[str, dict[str, Any]]
 
 
 def _load_intrinsics_profiles_from_camera_array(path: Path) -> dict[str, dict[str, Any]]:
+    """把 camera_array.toml 中带序列号的相机转换为内参 profile。
+
+    Args:
+        path: Caliscope camera_array.toml 路径。
+
+    Returns:
+        以相机 serial_number 为 key 的 profile 字典。
+    """
+
     camera_array = CameraArray.from_toml(path)
     profiles: dict[str, dict[str, Any]] = {}
     for cam_id, camera in camera_array.cameras.items():
@@ -533,6 +732,23 @@ def _apply_intrinsics_profiles(
     report_repo: IntrinsicReportRepository,
     persist_reports: bool = True,
 ) -> list[dict[str, Any]]:
+    """把内参库 profile 应用到当前 CameraArray。
+
+    匹配优先级为 serial_number，其次是显式启用的 source_cam_id fallback。fallback 会在
+    报告中标明，避免把无序列号匹配伪装成真实相机序列号匹配。
+
+    Args:
+        camera_array: 需要补齐内参的相机数组，会被原地更新。
+        profiles: 已加载的内参 profile。
+        library_path: 内参库路径，用于写入 intrinsics_source。
+        source_cam_id_fallback: 是否允许按 source_cam_id 匹配。
+        report_repo: 内参质量报告仓库。
+        persist_reports: plan-only 模式下为 False，避免写文件。
+
+    Returns:
+        每台相机的匹配/跳过记录。
+    """
+
     by_source_cam_id = _profiles_by_source_cam_id(profiles)
     results: list[dict[str, Any]] = []
 
@@ -586,6 +802,15 @@ def _apply_intrinsics_profiles(
 
 
 def _profiles_by_source_cam_id(profiles: dict[str, dict[str, Any]]) -> dict[int, tuple[str, dict[str, Any]]]:
+    """按 source_cam_id 为内参 profile 建索引。
+
+    Args:
+        profiles: 以 serial 或 profile key 索引的内参 profile。
+
+    Returns:
+        ``{source_cam_id: (profile_serial, profile)}`` 字典。
+    """
+
     by_source: dict[int, tuple[str, dict[str, Any]]] = {}
     for serial, profile in profiles.items():
         source_cam_id = _optional_int(profile.get("source_cam_id"))
@@ -600,6 +825,18 @@ def _select_intrinsics_profile(
     by_source_cam_id: dict[int, tuple[str, dict[str, Any]]],
     source_cam_id_fallback: bool,
 ) -> tuple[dict[str, Any] | None, str | None, str | None]:
+    """为单台相机选择最合适的内参 profile。
+
+    Args:
+        camera: 当前目标相机。
+        profiles: 以 serial/profile key 索引的内参库。
+        by_source_cam_id: source_cam_id 索引。
+        source_cam_id_fallback: 是否允许缺少序列号时按 cam_id/source_cam_id 匹配。
+
+    Returns:
+        ``(profile, method, profile_serial)``；无法匹配时三者均为 None。
+    """
+
     if camera.serial_number is not None and camera.serial_number in profiles:
         return profiles[camera.serial_number], "serial", camera.serial_number
     if source_cam_id_fallback and camera.cam_id in by_source_cam_id:
@@ -609,6 +846,22 @@ def _select_intrinsics_profile(
 
 
 def _adapt_profile_intrinsics(profile: dict[str, Any], target_size: tuple[int, int]) -> tuple[np.ndarray, np.ndarray, str]:
+    """把内参 profile 适配到目标视频分辨率。
+
+    支持三种情况：尺寸完全一致、同宽高比缩放、横竖屏 90 度旋转后再缩放。畸变系数
+    不随尺度变化；标准针孔模型旋转 90 度时需要同步旋转切向畸变 ``p1/p2``。
+
+    Args:
+        profile: 内参库中的单个 profile。
+        target_size: 目标相机视频尺寸，格式为 ``(width, height)``。
+
+    Returns:
+        ``(matrix, distortions, adaptation_label)``。
+
+    Raises:
+        ValueError: profile 数据无效，或尺寸无法通过缩放/旋转兼容。
+    """
+
     matrix, distortions = _validated_intrinsics_arrays(profile)
     source_size = tuple(int(v) for v in profile["size"])
     target_w, target_h = target_size
@@ -634,12 +887,33 @@ def _adapt_profile_intrinsics(profile: dict[str, Any], target_size: tuple[int, i
 
 
 def _same_aspect(source_size: tuple[int, int], target_size: tuple[int, int]) -> bool:
+    """判断两个分辨率是否具有相同宽高比。
+
+    Args:
+        source_size: 源尺寸 ``(width, height)``。
+        target_size: 目标尺寸 ``(width, height)``。
+
+    Returns:
+        宽高比在浮点误差范围内一致时返回 True。
+    """
+
     source_w, source_h = source_size
     target_w, target_h = target_size
     return abs((source_w / source_h) - (target_w / target_h)) < 1e-6
 
 
 def _scale_intrinsics(matrix: np.ndarray, sx: float, sy: float) -> np.ndarray:
+    """按图像缩放比例调整相机矩阵中的焦距和主点。
+
+    Args:
+        matrix: 3x3 相机内参矩阵。
+        sx: x 方向缩放比例。
+        sy: y 方向缩放比例。
+
+    Returns:
+        缩放后的新矩阵；不会修改输入矩阵。
+    """
+
     scaled = matrix.copy()
     scaled[0, 0] *= sx
     scaled[0, 2] *= sx
@@ -649,6 +923,16 @@ def _scale_intrinsics(matrix: np.ndarray, sx: float, sy: float) -> np.ndarray:
 
 
 def _rotate_intrinsics_90_ccw(matrix: np.ndarray, source_width: int) -> np.ndarray:
+    """把横屏内参旋转为 90 度逆时针后的竖屏内参。
+
+    Args:
+        matrix: 源图像的 3x3 内参矩阵。
+        source_width: 源图像宽度，用于变换 y 方向主点。
+
+    Returns:
+        旋转后的 3x3 内参矩阵。
+    """
+
     rotated = np.eye(3, dtype=np.float64)
     rotated[0, 0] = matrix[1, 1]
     rotated[1, 1] = matrix[0, 0]
@@ -658,6 +942,19 @@ def _rotate_intrinsics_90_ccw(matrix: np.ndarray, source_width: int) -> np.ndarr
 
 
 def _rotate_distortions_90_ccw(distortions: np.ndarray, fisheye: bool) -> np.ndarray:
+    """旋转 90 度逆时针对畸变参数的影响。
+
+    径向畸变不变；标准针孔模型的切向畸变 ``p1/p2`` 会随坐标轴旋转变换。fisheye
+    模型这里保持原样，因为它只使用径向项。
+
+    Args:
+        distortions: 一维畸变系数数组。
+        fisheye: 是否为 fisheye 模型。
+
+    Returns:
+        旋转后的畸变系数副本。
+    """
+
     if fisheye or distortions.size != 5:
         return distortions.copy()
     k1, k2, p1, p2, k3 = distortions.tolist()
@@ -665,6 +962,18 @@ def _rotate_distortions_90_ccw(distortions: np.ndarray, fisheye: bool) -> np.nda
 
 
 def _validated_intrinsics_arrays(profile: dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
+    """校验并转换内参 profile 中的矩阵和畸变系数。
+
+    Args:
+        profile: 内参 profile 字典。
+
+    Returns:
+        ``(matrix, distortions)``，均为 float64 numpy 数组。
+
+    Raises:
+        ValueError: 矩阵形状或畸变系数数量不符合模型要求。
+    """
+
     matrix = np.asarray(profile["matrix"], dtype=np.float64)
     if matrix.shape != (3, 3):
         raise ValueError(f"invalid matrix shape {matrix.shape}")
@@ -686,6 +995,21 @@ def _intrinsics_result(
     adaptation: str | None = None,
     reason: str | None = None,
 ) -> dict[str, Any]:
+    """构造单台相机的内参导入报告行。
+
+    Args:
+        camera: 当前相机。
+        status: ``matched``、``skipped`` 或其他状态文本。
+        method: 匹配方法，例如 serial 或 source_cam_id。
+        profile: 匹配到的内参 profile。
+        profile_serial: profile 对应的序列号/key。
+        adaptation: 尺寸适配方式说明。
+        reason: 跳过或失败原因。
+
+    Returns:
+        可写入 TOML 的报告字典。
+    """
+
     return {
         "cam_id": camera.cam_id,
         "status": status,
@@ -702,6 +1026,15 @@ def _intrinsics_result(
 
 
 def _intrinsic_report_from_profile(profile: dict[str, Any]) -> IntrinsicCalibrationReport:
+    """把内参库 profile 转成 Caliscope 的 IntrinsicCalibrationReport。
+
+    Args:
+        profile: 内参库中的单个 profile。
+
+    Returns:
+        可由现有报告仓库保存的 IntrinsicCalibrationReport。
+    """
+
     return IntrinsicCalibrationReport(
         rmse=float(profile.get("rmse", profile.get("error", 0.0)) or 0.0),
         frames_used=int(profile.get("frames_used", profile.get("grid_count", 0)) or 0),
@@ -722,6 +1055,22 @@ def _calibrate_missing_intrinsics(
     frame_step: int,
     report_repo: IntrinsicReportRepository,
 ) -> list[dict[str, Any]]:
+    """对内参库未覆盖的相机执行视频内参标定。
+
+    正常情况下本项目会全部从内参库复用；这个函数是兜底路径，避免新增相机或库缺失时
+    管线直接中断。
+
+    Args:
+        camera_array: 需要补齐内参的相机数组，会被原地更新。
+        intrinsic_videos: 内参视频路径映射。
+        charuco: 内参标定使用的 ChArUco 板。
+        frame_step: 内参视频抽帧步长。
+        report_repo: 内参报告仓库。
+
+    Returns:
+        实际重标定相机的报告列表。
+    """
+
     tracker = CharucoTracker(charuco)
     results: list[dict[str, Any]] = []
     for cam_id, camera in sorted(camera_array.cameras.items()):
@@ -747,6 +1096,17 @@ def _calibrate_missing_intrinsics(
 
 
 def _synchronize_extrinsic_recording(extrinsic_dir: Path, cam_ids: list[int], *, reuse_existing: bool) -> dict[str, Any]:
+    """同步外参视频时间线，或复用已有同步文件。
+
+    Args:
+        extrinsic_dir: 包含 ``cam_N.mp4`` 的外参视频目录。
+        cam_ids: 参与同步的相机 ID。
+        reuse_existing: 是否允许复用 ``timestamps.csv`` 和 ``sync_offsets.toml``。
+
+    Returns:
+        同步报告字典，并额外包含 ``mode`` 字段表示 computed/reused。
+    """
+
     if reuse_existing:
         existing = load_sync_summary(extrinsic_dir)
         timestamps_path = extrinsic_dir / "timestamps.csv"
@@ -772,6 +1132,24 @@ def _build_stage_plan(
     reuse_capture_volume: bool,
     allow_partial_extrinsics: bool,
 ) -> dict[str, Any]:
+    """生成断点复用计划，不执行任何重计算。
+
+    Args:
+        extrinsic_dir: 外参视频目录。
+        tracker_dir: ChArUco 点输出目录。
+        capture_volume_dir: capture volume 输出目录。
+        cam_ids: 当前工作区相机 ID。
+        frame_step: 外参点检测抽帧步长。
+        reuse_sync: 是否允许复用同步文件。
+        reuse_points: 是否允许复用 image_points.csv。
+        require_image_points_manifest: 是否要求 image_points manifest 匹配。
+        reuse_capture_volume: 是否允许复用完整 capture volume。
+        allow_partial_extrinsics: 是否允许复用 partial capture volume。
+
+    Returns:
+        sync、image_points、capture_volume 三个阶段的 action/available 明细。
+    """
+
     sync_available = load_sync_summary(extrinsic_dir) is not None and (extrinsic_dir / "timestamps.csv").exists()
     image_points_path = tracker_dir / "image_points.csv"
     image_points_available = image_points_path.exists()
@@ -816,6 +1194,12 @@ def _build_stage_plan(
 
 
 def _log_stage_plan(plan: dict[str, Any]) -> None:
+    """把阶段复用计划写入日志，便于远程运行时快速判断是否卡住。
+
+    Args:
+        plan: ``_build_stage_plan`` 返回的计划字典。
+    """
+
     logger.info(
         "Stage plan: sync=%s, image_points=%s, capture_volume=%s",
         plan["sync"]["action"],
@@ -825,6 +1209,15 @@ def _log_stage_plan(plan: dict[str, Any]) -> None:
 
 
 def _completed_capture_volume_status(capture_volume_dir: Path) -> tuple[bool, bool, list[int]]:
+    """检查已有 capture volume 是否由本管线生成且外参完整。
+
+    Args:
+        capture_volume_dir: capture volume 输出目录。
+
+    Returns:
+        ``(available, complete_extrinsics, unposed_cam_ids)``。
+    """
+
     report_path = capture_volume_dir / "calibration_report.toml"
     required_files = [
         capture_volume_dir / "camera_array.toml",
@@ -856,6 +1249,27 @@ def _extract_or_load_extrinsic_points(
     max_workers: int,
     show_progress: bool,
 ) -> ImagePoints:
+    """加载或提取外参阶段使用的同步 ChArUco 点。
+
+    只有 manifest 与当前 timestamps、cam_ids 和 frame_step 匹配时，默认 resume 才会复用
+    image_points.csv。这样可以避免把旧抽帧参数或旧同步结果下的检测点误用于新标定。
+
+    Args:
+        extrinsic_dir: 外参视频目录。
+        tracker_dir: ChArUco 检测结果目录。
+        cameras: 当前相机数据，提供 rotation_count。
+        charuco: ChArUco target。
+        frame_step: 同步帧抽样步长。
+        reuse_existing: 是否允许复用已有 image_points.csv。
+        require_manifest: 是否要求 manifest 完全匹配。
+        parallel: 是否并行处理同一 sync index 的多相机帧。
+        max_workers: 相机 worker 上限。
+        show_progress: 是否显示 tqdm 进度条。
+
+    Returns:
+        ImagePoints；对象上会附加 ``_resumed_from_cache`` 标记供报告使用。
+    """
+
     image_points_path = tracker_dir / "image_points.csv"
     if reuse_existing and image_points_path.exists():
         if not require_manifest or _image_points_manifest_matches(
@@ -881,6 +1295,8 @@ def _extract_or_load_extrinsic_points(
     last_progress = 0
 
     def on_progress(current: int, total: int) -> None:
+        """把底层处理进度转发到 tqdm 或日志。"""
+
         nonlocal last_progress
         if progress_bar is not None:
             progress_bar.update(max(0, current - last_progress))
@@ -927,6 +1343,15 @@ def _extract_or_load_extrinsic_points(
 
 
 def _image_points_manifest_path(image_points_path: Path) -> Path:
+    """返回 image_points.csv 对应的 manifest 路径。
+
+    Args:
+        image_points_path: ChArUco image_points.csv 路径。
+
+    Returns:
+        同目录下的 ``image_points.meta.toml`` 路径。
+    """
+
     return image_points_path.with_name(f"{image_points_path.stem}.meta.toml")
 
 
@@ -937,6 +1362,18 @@ def _image_points_manifest(
     cam_ids: list[int],
     frame_step: int,
 ) -> dict[str, Any]:
+    """构造 image_points.csv 的复用 manifest。
+
+    Args:
+        image_points: 刚提取完成的点数据。
+        extrinsic_dir: 外参视频目录。
+        cam_ids: 当前相机 ID 列表。
+        frame_step: 本次提取使用的同步帧抽样步长。
+
+    Returns:
+        包含同步文件 mtime 和点数据摘要的 manifest 字典。
+    """
+
     timestamps_path = extrinsic_dir / "timestamps.csv"
     summary = _summarize_image_points(image_points)
     return {
@@ -957,6 +1394,18 @@ def _image_points_manifest_matches(
     cam_ids: list[int],
     frame_step: int,
 ) -> bool:
+    """判断已有 image_points manifest 是否匹配当前运行参数。
+
+    Args:
+        image_points_path: 待复用的 image_points.csv 路径。
+        extrinsic_dir: 当前外参视频目录。
+        cam_ids: 当前相机 ID 列表。
+        frame_step: 当前抽样步长。
+
+    Returns:
+        manifest 存在且 schema、相机集合、抽样步长、timestamps mtime 均一致时返回 True。
+    """
+
     manifest_path = _image_points_manifest_path(image_points_path)
     timestamps_path = extrinsic_dir / "timestamps.csv"
     if not manifest_path.exists() or not timestamps_path.exists():
@@ -987,10 +1436,31 @@ def _calibrate_capture_volume(
     show_progress: bool,
     allow_partial_extrinsics: bool,
 ) -> tuple[dict[str, Any], CaptureVolume]:
+    """执行外参 bootstrap、两轮 BA 和可选坐标系对齐。
+
+    默认要求所有相机都获得外参；如果外参图被 ChArUco 观测分裂，会在 BA 前失败，避免
+    把只覆盖部分相机的低 RMSE 结果误认为完整标定。
+
+    Args:
+        image_points: 外参阶段同步 ChArUco 检测点。
+        camera_array: 已有内参的相机数组。
+        filter_percentile: 第一轮 BA 后剔除的最差观测百分比。
+        max_nfev: 每轮 BA 最大函数评估次数。
+        scipy_verbose: SciPy least_squares 日志级别。
+        align_to_object: 是否对齐到 ChArUco 板坐标系。
+        show_progress: 是否显示阶段进度条。
+        allow_partial_extrinsics: 是否允许部分相机未 pose 时继续。
+
+    Returns:
+        ``(capture_report, capture_volume)``。
+    """
+
     step_count = 5 if align_to_object else 4
     progress_bar = _make_progress_bar(show_progress, total=step_count, desc="Capture volume", unit="stage")
 
     def finish_stage(label: str) -> None:
+        """更新 capture volume 阶段进度条。"""
+
         if progress_bar is not None:
             progress_bar.set_postfix_str(label)
             progress_bar.update(1)
@@ -1060,6 +1530,16 @@ def _load_completed_capture_volume(
     *,
     allow_partial_extrinsics: bool,
 ) -> tuple[dict[str, Any] | None, CaptureVolume | None]:
+    """在 resume 模式下加载已完成的 capture volume。
+
+    Args:
+        capture_volume_dir: capture volume 输出目录。
+        allow_partial_extrinsics: 是否允许复用 partial capture volume。
+
+    Returns:
+        可复用时返回 ``(capture_report, capture_volume)``，否则返回 ``(None, None)``。
+    """
+
     report_path = capture_volume_dir / "calibration_report.toml"
     available, complete, unposed = _completed_capture_volume_status(capture_volume_dir)
     if not available:
@@ -1082,6 +1562,15 @@ def _load_completed_capture_volume(
 
 
 def _choose_alignment_sync_index(volume: CaptureVolume) -> int | None:
+    """选择用于坐标系对齐的 ChArUco 可见帧。
+
+    Args:
+        volume: 已完成 BA 的 capture volume。
+
+    Returns:
+        能提供最多 ChArUco 点和相机观测的 sync_index；找不到时返回 None。
+    """
+
     img_df = volume.image_points.df
     world_sync_indices = set(int(v) for v in volume.world_points.df["sync_index"].unique())
     candidates = img_df[img_df["sync_index"].isin(world_sync_indices)]
@@ -1102,6 +1591,15 @@ def _choose_alignment_sync_index(volume: CaptureVolume) -> int | None:
 
 
 def _summarize_image_points(image_points: ImagePoints) -> dict[str, Any]:
+    """汇总二维检测点规模和各相机观测数量。
+
+    Args:
+        image_points: ChArUco 或其他 tracker 输出的二维点。
+
+    Returns:
+        可写入报告的观测摘要。
+    """
+
     df = image_points.df
     by_camera = df.groupby("cam_id").size().to_dict() if not df.empty else {}
     return {
@@ -1114,6 +1612,15 @@ def _summarize_image_points(image_points: ImagePoints) -> dict[str, Any]:
 
 
 def _summarize_reprojection_report(volume: CaptureVolume) -> dict[str, Any]:
+    """把 CaptureVolume 的重投影报告压缩成 TOML 友好的字典。
+
+    Args:
+        volume: 已经可计算 reprojection_report 的 capture volume。
+
+    Returns:
+        包含总体 RMSE、逐相机 RMSE 和匹配观测数量的摘要。
+    """
+
     report = volume.reprojection_report
     return {
         "overall_rmse": float(report.overall_rmse),
@@ -1128,6 +1635,15 @@ def _summarize_reprojection_report(volume: CaptureVolume) -> dict[str, Any]:
 
 
 def _optimization_status_dict(volume: CaptureVolume) -> dict[str, Any] | None:
+    """提取最后一次 BA 的优化状态。
+
+    Args:
+        volume: BA 后的 capture volume。
+
+    Returns:
+        优化状态字典；如果该 volume 不是 optimize() 结果则返回 None。
+    """
+
     status = volume.optimization_status
     if status is None:
         return None
@@ -1139,7 +1655,19 @@ def _optimization_status_dict(volume: CaptureVolume) -> dict[str, Any] | None:
     }
 
 
-def _make_progress_bar(enabled: bool, *, total: int, desc: str, unit: str):
+def _make_progress_bar(enabled: bool, *, total: int, desc: str, unit: str) -> Any | None:
+    """按需创建 tqdm 进度条。
+
+    Args:
+        enabled: 是否启用进度条。
+        total: 进度条总量。
+        desc: 进度条标题。
+        unit: 进度单位。
+
+    Returns:
+        tqdm 实例；未启用或未安装 tqdm 时返回 None。
+    """
+
     if not enabled:
         return None
     try:
@@ -1151,18 +1679,48 @@ def _make_progress_bar(enabled: bool, *, total: int, desc: str, unit: str):
 
 
 def _optional_float(value: Any) -> float | None:
+    """把可选数值转换为 float。
+
+    Args:
+        value: None 或可转换为 float 的值。
+
+    Returns:
+        None 或 float。
+    """
+
     if value is None:
         return None
     return float(value)
 
 
 def _optional_int(value: Any) -> int | None:
+    """把可选数值转换为 int。
+
+    Args:
+        value: None 或可转换为 int 的值。
+
+    Returns:
+        None 或 int。
+    """
+
     if value is None:
         return None
     return int(value)
 
 
 def _toml_clean(value: Any) -> Any:
+    """递归清理对象，确保 rtoml 可以稳定序列化。
+
+    该函数会去掉 None、转换 numpy scalar 和 Path，并把 list-of-table 字段排到普通
+    table 后面，避免 rtoml 抛出 ``values must be emitted before tables``。
+
+    Args:
+        value: 任意待写入 TOML 的 Python 对象。
+
+    Returns:
+        只包含 TOML 可序列化类型的对象。
+    """
+
     if value is None:
         return None
     if isinstance(value, np.generic):
@@ -1187,6 +1745,15 @@ def _toml_clean(value: Any) -> Any:
 
 
 def _toml_sort_key(value: Any) -> tuple[int, str]:
+    """为 TOML 字典字段提供稳定排序权重。
+
+    Args:
+        value: 字典中的字段值。
+
+    Returns:
+        排序权重；标量优先，普通 table 其次，array-of-table 最后。
+    """
+
     if isinstance(value, list) and value and all(isinstance(item, dict) for item in value):
         return (2, "")
     if isinstance(value, dict):
@@ -1195,6 +1762,12 @@ def _toml_sort_key(value: Any) -> tuple[int, str]:
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
+    """构造命令行参数解析器。
+
+    Returns:
+        配置好所有 CLI 开关的 ArgumentParser。
+    """
+
     parser = argparse.ArgumentParser(description="Run a non-GUI Caliscope workspace calibration pipeline.")
     parser.add_argument("--workspace", type=Path, required=True, help="Caliscope workspace root")
     parser.add_argument("--intrinsics-library", type=Path, required=True, help="Intrinsics library TOML/folder/workspace")
@@ -1261,6 +1834,15 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """命令行入口函数。
+
+    Args:
+        argv: 可选命令行参数；None 表示使用 sys.argv。
+
+    Returns:
+        进程退出码，成功时为 0。
+    """
+
     parser = _build_arg_parser()
     args = parser.parse_args(argv)
     logging.basicConfig(

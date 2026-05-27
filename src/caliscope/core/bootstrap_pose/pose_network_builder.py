@@ -383,6 +383,18 @@ def reject_outliers(
 
 
 def quaternion_average(quaternions: NDArray[np.float64]) -> np.ndarray:
+    """对一组四元数做稳健平均。
+
+    Args:
+        quaternions: 形状为 ``(N, 4)`` 的四元数数组，顺序为 ``(w, x, y, z)``。
+
+    Returns:
+        单位化后的平均四元数。
+
+    Raises:
+        ValueError: 输入为空时抛出。
+    """
+
     if len(quaternions) == 0:
         raise ValueError("Cannot average empty quaternion array")
     if len(quaternions) == 1:
@@ -454,14 +466,15 @@ def compute_relative_poses(
     camera_to_object_poses: dict[tuple[int, int], tuple[NDArray[np.float64], NDArray[np.float64], float]],
     camera_array: CameraArray,
 ) -> dict[tuple[tuple[int, int], int], StereoPair]:
-    """
-    Compute relative poses between camera pairs at each sync_index.
+    """计算每个 sync_index 上相机对之间的相对位姿。
 
-    For cameras A and B observing the same object at a sync index:
-    T_B_A = T_B_obj @ T_obj_A = T_B_obj @ inv(T_A_obj)
+    当相机 A 和 B 在同一时刻都能通过 PnP 求出相机到标定板的位姿时，相对位姿为
+    ``T_B_A = T_B_obj @ T_obj_A = T_B_obj @ inv(T_A_obj)``。StereoPair 的
+    ``error_score`` 先记录两台相机 PnP 重投影误差之和，后续如果能计算 stereo RMSE
+    会被覆盖；如果两台相机没有共同 corner id，这个 PnP 分数可作为 fallback 图权重。
 
     Returns:
-        dict mapping (pair, sync_index) -> StereoPair with relative pose
+        ``{((cam_a, cam_b), sync_index): StereoPair}``。
     """
     logger.info("Computing relative poses between camera pairs...")
     relative_poses: dict[tuple[tuple[int, int], int], StereoPair] = {}
@@ -485,7 +498,9 @@ def compute_relative_poses(
             R_rel = R_b @ R_a_inv
             t_rel = R_b @ t_a_inv + t_b
 
-            # Store as StereoPair (error_score will be computed after aggregation)
+            # 这里先保存两台相机各自 PnP 的重投影误差和，作为后续无法计算 stereo RMSE
+            # 时的 fallback 分数。这样两台相机同帧看见同一块板但没有共同 corner id 时，
+            # 仍可保留这条几何边用于连通相机图。
             pair_key = (cam_id_a, cam_id_b)
             relative_poses[(pair_key, sync_index)] = StereoPair(
                 primary_cam_id=cam_id_a,
@@ -500,14 +515,13 @@ def compute_relative_poses(
 
 
 def aggregate_poses(filtered_poses: dict[tuple[int, int], list[StereoPair]]) -> dict[tuple[int, int], StereoPair]:
-    """
-    Aggregate per-sync-index poses into a single robust estimate per pair.
+    """把同一相机对在多个 sync_index 上的相对位姿聚合为一条边。
 
-    Uses quaternion averaging for rotations and simple averaging for translations
-    after outlier rejection.
+    旋转使用四元数平均，平移使用普通均值；error_score 保留为 PnP fallback 分数均值，
+    等后续 stereo RMSE 计算成功后再替换。
 
     Returns:
-        dict mapping pair -> aggregated StereoPair
+        ``{(cam_a, cam_b): aggregated_stereo_pair}``。
     """
     logger.info("Aggregating poses...")
 
@@ -530,6 +544,8 @@ def aggregate_poses(filtered_poses: dict[tuple[int, int], list[StereoPair]]) -> 
         translations = [sp.translation for sp in stereo_pairs]
         avg_t = np.mean(translations, axis=0)
 
+        # 优先用后续 stereo RMSE 评分；如果某个 pair 缺少共同 corner id，聚合后的 PnP
+        # 误差均值仍可作为图搜索权重，避免把有效桥接边提前丢弃。
         finite_errors = [sp.error_score for sp in stereo_pairs if np.isfinite(sp.error_score)]
         fallback_error = float(np.mean(finite_errors)) if finite_errors else float("nan")
         aggregated[pair] = StereoPair(
@@ -547,13 +563,14 @@ def aggregate_poses(filtered_poses: dict[tuple[int, int], list[StereoPair]]) -> 
 def estimate_pnp_paired_pose_network(
     aggregated_pairs_wo_rmse: dict[tuple[int, int], StereoPair], camera_array: CameraArray, image_points: ImagePoints
 ) -> PairedPoseNetwork:
-    """
-    Create a PairedPoseNetwork from aggregated stereo pairs with RMSE scores.
+    """从聚合后的 PnP 相机对位姿构建 PairedPoseNetwork。
 
-    Calculates the Stereo RMSE for each pair and populates the error_score field.
+    正常情况下使用共同 corner id 计算 stereo RMSE 作为边权；如果某条边没有足够共同
+    corner，但两台相机在同一帧都能各自 PnP 成功，则退回使用 PnP 重投影误差分数，
+    保留这条可能用于桥接相机图的边。
 
     Returns:
-        PairedPoseNetwork ready for use in camera array initialization
+        可用于初始化 CameraArray 外参的 PairedPoseNetwork。
     """
     logger.info("Creating PairedPoseNetwork...")
 
