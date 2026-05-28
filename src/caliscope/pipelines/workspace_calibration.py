@@ -73,6 +73,8 @@ class WorkspaceCalibrationConfig:
         opencv_threads: OpenCV 每进程内部线程数；None 表示自动按 CPU/worker 均分。
         show_progress: 是否显示 tqdm 进度条。
         filter_percentile: 第一轮 BA 后剔除的最差重投影误差百分比。
+        filter_scope: 剔除范围；sync_index 表示按整帧剔除。
+        filter_sigma: sync_index 整帧剔除的可选 robust sigma 阈值；None 表示只按百分比剔除。
         max_nfev: 每轮 SciPy least_squares 最大函数评估次数。
         scipy_verbose: SciPy 优化器日志级别。
         align_to_object: 是否把最终坐标系对齐到某一帧 ChArUco 板。
@@ -98,6 +100,8 @@ class WorkspaceCalibrationConfig:
     opencv_threads: int | None = None
     show_progress: bool = True
     filter_percentile: float = 2.5
+    filter_scope: str = "per_camera"
+    filter_sigma: float | None = None
     max_nfev: int = 1000
     scipy_verbose: int = 0
     align_to_object: bool = False
@@ -251,6 +255,8 @@ def run_workspace_calibration(config: WorkspaceCalibrationConfig) -> dict[str, A
             image_points=image_points,
             camera_array=camera_array,
             filter_percentile=config.filter_percentile,
+            filter_scope=config.filter_scope,
+            filter_sigma=config.filter_sigma,
             max_nfev=config.max_nfev,
             scipy_verbose=config.scipy_verbose,
             align_to_object=config.align_to_object,
@@ -327,6 +333,12 @@ def _validate_config(config: WorkspaceCalibrationConfig, workspace: Path, intrin
         raise ValueError("intrinsic_frame_step must be >= 1")
     if not (0 < config.filter_percentile <= 100):
         raise ValueError("filter_percentile must be in (0, 100]")
+    if config.filter_scope not in {"per_camera", "overall", "sync_index"}:
+        raise ValueError("filter_scope must be one of: per_camera, overall, sync_index")
+    if config.filter_scope == "sync_index" and config.filter_percentile > 30:
+        raise ValueError("sync_index frame filtering is capped at 30%")
+    if config.filter_sigma is not None and config.filter_sigma <= 0:
+        raise ValueError("filter_sigma must be positive when provided")
     if config.max_nfev < 1:
         raise ValueError("max_nfev must be >= 1")
     if config.workers is not None and config.workers < 1:
@@ -1430,6 +1442,8 @@ def _calibrate_capture_volume(
     image_points: ImagePoints,
     camera_array: CameraArray,
     filter_percentile: float,
+    filter_scope: str,
+    filter_sigma: float | None,
     max_nfev: int,
     scipy_verbose: int,
     align_to_object: bool,
@@ -1444,7 +1458,9 @@ def _calibrate_capture_volume(
     Args:
         image_points: 外参阶段同步 ChArUco 检测点。
         camera_array: 已有内参的相机数组。
-        filter_percentile: 第一轮 BA 后剔除的最差观测百分比。
+        filter_percentile: 第一轮 BA 后剔除的最差百分比。
+        filter_scope: per_camera/overall 按观测点剔除；sync_index 按整帧剔除。
+        filter_sigma: sync_index 整帧剔除的可选 robust sigma 阈值；None 表示只按百分比剔除。
         max_nfev: 每轮 BA 最大函数评估次数。
         scipy_verbose: SciPy least_squares 日志级别。
         align_to_object: 是否对齐到 ChArUco 板坐标系。
@@ -1489,10 +1505,88 @@ def _calibrate_capture_volume(
         first_report = _summarize_reprojection_report(first)
         logger.info("First bundle adjustment RMSE: %.4f px", first_report["overall_rmse"])
 
-        filtered = first.filter_by_percentile_error(filter_percentile) if filter_percentile > 0 else first
+        filter_stats: dict[str, Any] | None = None
+        if filter_percentile > 0:
+            if filter_scope == "sync_index":
+                filter_stats = first.describe_sync_index_error_filter(
+                    filter_percentile,
+                    sigma_multiplier=filter_sigma,
+                )
+                filtered = first.filter_by_percentile_error(
+                    filter_percentile,
+                    scope=filter_scope,
+                    sigma_multiplier=filter_sigma,
+                )
+            else:
+                percentile_before = first.reprojection_report.n_observations_matched
+                percentile_filtered = first.filter_by_percentile_error(filter_percentile, scope=filter_scope)
+                percentile_after = percentile_filtered.reprojection_report.n_observations_matched
+                filter_stats = {
+                    "mode": "point_percentile_then_sigma" if filter_sigma is not None else "point_percentile",
+                    "scope": filter_scope,
+                    "percentile": {
+                        "percentile": float(filter_percentile),
+                        "observations_before": int(percentile_before),
+                        "observations_after": int(percentile_after),
+                        "actual_drop_observations": int(percentile_before - percentile_after),
+                        "actual_drop_percent": float(
+                            ((percentile_before - percentile_after) / percentile_before) * 100.0
+                        )
+                        if percentile_before > 0
+                        else 0.0,
+                    },
+                }
+                if filter_sigma is not None:
+                    sigma_stats = percentile_filtered.describe_sigma_error_filter(
+                        filter_sigma, scope=filter_scope
+                    )
+                    filtered = percentile_filtered.filter_by_sigma_error(
+                        filter_sigma, scope=filter_scope
+                    )
+                    sigma_after = filtered.reprojection_report.n_observations_matched
+                    sigma_stats["observations_after"] = int(sigma_after)
+                    filter_stats["sigma"] = sigma_stats
+                else:
+                    filtered = percentile_filtered
+        else:
+            filtered = first
         finish_stage("filter")
         filtered_report = _summarize_reprojection_report(filtered)
-        logger.info("After %.2f%% reprojection filtering RMSE: %.4f px", filter_percentile, filtered_report["overall_rmse"])
+        if filter_stats is not None:
+            if filter_scope == "sync_index":
+                sigma_suffix = ""
+                if filter_sigma is not None and filter_stats.get("sigma_threshold") is not None:
+                    sigma_suffix = (
+                        f" above median+{filter_sigma:g}sigma threshold "
+                        f"{filter_stats['sigma_threshold']:.4f}px"
+                    )
+                logger.info(
+                    "After %.2f%% %s reprojection filtering RMSE: %.4f px; dropped %d/%d frames%s",
+                    filter_percentile,
+                    filter_scope,
+                    filtered_report["overall_rmse"],
+                    filter_stats["actual_drop_frames"],
+                    filter_stats["total_frames"],
+                    sigma_suffix,
+                )
+            else:
+                percentile_stats = filter_stats.get("percentile", {})
+                sigma_stats = filter_stats.get("sigma")
+                sigma_msg = ""
+                if sigma_stats is not None:
+                    sigma_msg = (
+                        f" then {sigma_stats.get('actual_drop_observations', 0)} sigma points "
+                        f"above {filter_sigma:g}sigma"
+                    )
+                logger.info(
+                    "After %.2f%% %s point filtering%s RMSE: %.4f px; dropped %d percentile points%s",
+                    filter_percentile,
+                    filter_scope,
+                    f" + {filter_sigma:g}sigma" if filter_sigma is not None else "",
+                    filtered_report["overall_rmse"],
+                    percentile_stats.get("actual_drop_observations", 0),
+                    sigma_msg,
+                )
 
         final = filtered.optimize(max_nfev=max_nfev, verbose=scipy_verbose, strict=False)
         finish_stage("second BA")
@@ -1518,6 +1612,9 @@ def _calibrate_capture_volume(
             "final": final_report,
             "final_rmse": final_report["overall_rmse"],
             "filter_percentile": filter_percentile,
+            "filter_scope": filter_scope,
+            "filter_sigma": filter_sigma,
+            "filter_stats": filter_stats,
             "alignment_sync_index": alignment_sync_index,
             "optimization_status": _optimization_status_dict(final),
         },
@@ -1820,6 +1917,21 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Show tqdm progress bars for long stages",
     )
     parser.add_argument("--filter-percentile", type=float, default=2.5, help="Worst reprojection error percentile to remove")
+    parser.add_argument(
+        "--filter-scope",
+        choices=("per_camera", "overall", "sync_index"),
+        default="per_camera",
+        help="How to filter outliers after first BA; sync_index removes whole synchronized frames and is capped at 30%",
+    )
+    parser.add_argument(
+        "--filter-sigma",
+        type=float,
+        default=None,
+        help=(
+            "Apply robust median + N * upper-sigma filtering after percentile filtering. "
+            "For point scopes this removes additional point observations; for sync_index it gates frame removal."
+        ),
+    )
     parser.add_argument("--max-nfev", type=int, default=1000, help="Maximum function evaluations per BA pass")
     parser.add_argument("--scipy-verbose", type=int, default=0, choices=(0, 1, 2), help="SciPy least_squares verbosity")
     parser.add_argument("--align-to-object", action="store_true", help="Align final volume to a visible Charuco board frame")
@@ -1869,6 +1981,8 @@ def main(argv: list[str] | None = None) -> int:
         opencv_threads=args.opencv_threads,
         show_progress=args.progress,
         filter_percentile=args.filter_percentile,
+        filter_scope=args.filter_scope,
+        filter_sigma=args.filter_sigma,
         max_nfev=args.max_nfev,
         scipy_verbose=args.scipy_verbose,
         align_to_object=args.align_to_object,

@@ -8,7 +8,7 @@ import numpy as np
 from dataclasses import dataclass, field
 from functools import cached_property
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 import logging
 
 from caliscope.cameras.camera_array import CameraArray
@@ -36,6 +36,8 @@ from caliscope.core.scale_accuracy import (
 import pandas as pd
 
 logger = logging.getLogger(__file__)
+
+SYNC_INDEX_FILTER_PERCENTILE_CAP = 30.0
 
 
 @dataclass(frozen=True)
@@ -528,15 +530,23 @@ class CaptureVolume:
         return self._filter_by_reprojection_thresholds(thresholds, min_per_camera)
 
     def filter_by_percentile_error(
-        self, percentile: float, scope: Literal["per_camera", "overall"] = "per_camera", min_per_camera: int = 10
+        self,
+        percentile: float,
+        scope: Literal["per_camera", "overall", "sync_index"] = "per_camera",
+        min_per_camera: int = 10,
+        sigma_multiplier: float | None = None,
     ) -> CaptureVolume:
         """
         Remove worst N% of observations based on reprojection error.
 
         Args:
             percentile: Percentage of worst observations to remove (0-100)
-            scope: "per_camera" computes percentile per camera, "overall" uses global percentile
+            scope: "per_camera" computes percentile per camera, "overall" uses global percentile,
+                "sync_index" removes whole synchronized frames by frame-level RMS error
             min_per_camera: Minimum observations per camera (safety floor)
+            sigma_multiplier: Optional robust one-sided sigma multiplier for sync_index filtering.
+                When set, only frames above median + N * upper_sigma are eligible for removal,
+                and percentile remains a maximum removal cap.
 
         Returns:
             New CaptureVolume with filtered observations
@@ -547,8 +557,20 @@ class CaptureVolume:
         if min_per_camera < 1:
             raise ValueError(f"min_per_camera must be >= 1, got {min_per_camera}")
 
+        if sigma_multiplier is not None and sigma_multiplier <= 0:
+            raise ValueError(f"sigma_multiplier must be positive when provided, got {sigma_multiplier}")
+        if sigma_multiplier is not None and scope != "sync_index":
+            raise ValueError("Use filter_by_sigma_error for point-level sigma filtering")
+
         report = self.reprojection_report
         raw_errors = report.raw_errors
+
+        if scope == "sync_index":
+            return self.filter_by_sync_index_percentile_error(
+                percentile,
+                min_per_camera=min_per_camera,
+                sigma_multiplier=sigma_multiplier,
+            )
 
         if scope == "per_camera":
             # Compute (100 - percentile)th percentile per camera
@@ -569,9 +591,322 @@ class CaptureVolume:
             thresholds = {cam_id: global_threshold for cam_id in self.camera_array.posed_cameras.keys()}
 
         else:
-            raise ValueError(f"scope must be 'per_camera' or 'overall', got {scope}")
+            raise ValueError(f"scope must be 'per_camera', 'overall', or 'sync_index', got {scope}")
 
         return self._filter_by_reprojection_thresholds(thresholds, min_per_camera)
+
+    @staticmethod
+    def _robust_upper_sigma(values: NDArray[np.float64]) -> tuple[float, float]:
+        """Return median and one-sided robust sigma for the high-error tail."""
+        if values.size == 0:
+            return 0.0, 0.0
+
+        median = float(np.median(values))
+        upper_deviations = values[values >= median] - median
+        upper_deviations = upper_deviations[upper_deviations > 0]
+        if upper_deviations.size > 0:
+            upper_sigma = float(np.median(upper_deviations) * 1.4826)
+        elif values.size > 1:
+            upper_sigma = float(np.std(values, ddof=1))
+        else:
+            upper_sigma = 0.0
+        return median, upper_sigma
+
+    def _sigma_thresholds_for_points(
+        self,
+        sigma_multiplier: float,
+        scope: Literal["per_camera", "overall"],
+        min_per_camera: int,
+    ) -> tuple[dict[int, float], dict[str, Any]]:
+        """Compute point-level robust sigma thresholds and drop statistics."""
+        if sigma_multiplier <= 0:
+            raise ValueError(f"sigma_multiplier must be positive, got {sigma_multiplier}")
+        if min_per_camera < 1:
+            raise ValueError(f"min_per_camera must be >= 1, got {min_per_camera}")
+        if scope not in {"per_camera", "overall"}:
+            raise ValueError(f"point-level sigma filtering requires per_camera or overall scope, got {scope}")
+
+        raw_errors = self.reprojection_report.raw_errors
+        if raw_errors.empty:
+            return {}, {
+                "mode": "point_median_sigma",
+                "scope": scope,
+                "total_observations": 0,
+                "candidate_drop_observations": 0,
+                "actual_drop_observations": 0,
+                "actual_drop_percent": 0.0,
+                "restored_for_min_per_camera": 0,
+                "sigma_multiplier": float(sigma_multiplier),
+            }
+
+        thresholds: dict[int, float] = {}
+        metadata: dict[str, Any] = {
+            "mode": "point_median_sigma",
+            "scope": scope,
+            "total_observations": int(len(raw_errors)),
+            "sigma_multiplier": float(sigma_multiplier),
+        }
+
+        if scope == "overall":
+            values = raw_errors["euclidean_error"].to_numpy(dtype=np.float64)
+            median, upper_sigma = self._robust_upper_sigma(values)
+            threshold = median + sigma_multiplier * upper_sigma
+            thresholds = {cam_id: float(threshold) for cam_id in self.camera_array.posed_cameras.keys()}
+            metadata.update(
+                {
+                    "median_error": median,
+                    "upper_sigma": upper_sigma,
+                    "sigma_threshold": float(threshold),
+                    "candidate_drop_observations": int((raw_errors["euclidean_error"] > threshold).sum()),
+                }
+            )
+        else:
+            candidate_drop_observations = 0
+            by_camera: dict[int, dict[str, Any]] = {}
+            for cam_id in self.camera_array.posed_cameras.keys():
+                camera_errors = raw_errors[raw_errors["cam_id"] == cam_id]["euclidean_error"]
+                if len(camera_errors) == 0:
+                    thresholds[cam_id] = float(np.inf)
+                    by_camera[cam_id] = {
+                        "observations": 0,
+                        "candidate_drop_observations": 0,
+                        "median_error": None,
+                        "upper_sigma": None,
+                        "sigma_threshold": None,
+                    }
+                    continue
+                values = camera_errors.to_numpy(dtype=np.float64)
+                median, upper_sigma = self._robust_upper_sigma(values)
+                threshold = median + sigma_multiplier * upper_sigma
+                thresholds[cam_id] = float(threshold)
+                candidate_count = int((camera_errors > threshold).sum())
+                candidate_drop_observations += candidate_count
+                by_camera[cam_id] = {
+                    "observations": int(len(camera_errors)),
+                    "candidate_drop_observations": candidate_count,
+                    "median_error": median,
+                    "upper_sigma": upper_sigma,
+                    "sigma_threshold": float(threshold),
+                }
+            metadata["candidate_drop_observations"] = candidate_drop_observations
+            metadata["by_camera"] = by_camera
+
+        threshold_series = raw_errors["cam_id"].map(thresholds)
+        keep_mask = (raw_errors["euclidean_error"] <= threshold_series).copy()
+        initial_drop_count = int((~keep_mask).sum())
+
+        for cam_id in raw_errors["cam_id"].unique():
+            camera_idx = raw_errors["cam_id"] == cam_id
+            n_keep = int(keep_mask[camera_idx].sum())
+            n_total = int(camera_idx.sum())
+            if n_keep < min_per_camera and n_keep < n_total:
+                n_needed = min(min_per_camera, n_total) - n_keep
+                filtered_errors = raw_errors.loc[camera_idx & ~keep_mask, "euclidean_error"]
+                if len(filtered_errors) >= n_needed:  # type: ignore[arg-type]
+                    threshold_to_add = float(filtered_errors.nsmallest(n_needed).iloc[-1])
+                    keep_mask[camera_idx] = raw_errors.loc[camera_idx, "euclidean_error"] <= threshold_to_add
+
+        actual_drop_count = int((~keep_mask).sum())
+        metadata.update(
+            {
+                "actual_drop_observations": actual_drop_count,
+                "actual_drop_percent": float((actual_drop_count / len(raw_errors)) * 100.0),
+                "restored_for_min_per_camera": int(initial_drop_count - actual_drop_count),
+            }
+        )
+        return thresholds, metadata
+
+    def describe_sigma_error_filter(
+        self,
+        sigma_multiplier: float,
+        scope: Literal["per_camera", "overall"] = "per_camera",
+        min_per_camera: int = 10,
+    ) -> dict[str, Any]:
+        """Return point-level robust sigma filter metadata without applying it."""
+        _, metadata = self._sigma_thresholds_for_points(sigma_multiplier, scope, min_per_camera)
+        return metadata
+
+    def filter_by_sigma_error(
+        self,
+        sigma_multiplier: float,
+        scope: Literal["per_camera", "overall"] = "per_camera",
+        min_per_camera: int = 10,
+    ) -> CaptureVolume:
+        """Remove point observations above median + N * robust upper sigma."""
+        thresholds, _ = self._sigma_thresholds_for_points(sigma_multiplier, scope, min_per_camera)
+        if not thresholds:
+            return self
+        return self._filter_by_reprojection_thresholds(thresholds, min_per_camera)
+
+    def _select_sync_index_filter_frames(
+        self,
+        percentile: float,
+        min_per_camera: int,
+        sigma_multiplier: float | None = None,
+    ) -> tuple[set[int], set[int], dict[str, Any]]:
+        """Select sync_index values to keep/drop for frame-level filtering."""
+        if not (0 < percentile <= SYNC_INDEX_FILTER_PERCENTILE_CAP):
+            raise ValueError(
+                f"sync_index frame filtering percentile must be in (0, {SYNC_INDEX_FILTER_PERCENTILE_CAP:g}], "
+                f"got {percentile}"
+            )
+        if min_per_camera < 1:
+            raise ValueError(f"min_per_camera must be >= 1, got {min_per_camera}")
+        if sigma_multiplier is not None and sigma_multiplier <= 0:
+            raise ValueError(f"sigma_multiplier must be positive when provided, got {sigma_multiplier}")
+
+        raw_errors = self.reprojection_report.raw_errors
+        if raw_errors.empty:
+            metadata: dict[str, Any] = {
+                "mode": "median_sigma" if sigma_multiplier is not None else "percentile",
+                "total_frames": 0,
+                "percentile_cap": float(percentile),
+                "max_drop_frames": 0,
+                "candidate_drop_frames": 0,
+                "planned_drop_frames": 0,
+                "actual_drop_frames": 0,
+                "actual_drop_percent": 0.0,
+                "restored_for_min_per_camera": 0,
+            }
+            return set(), set(), metadata
+
+        frame_scores = (
+            raw_errors.groupby("sync_index", as_index=False)
+            .agg(rms_error=("euclidean_error", lambda values: float(np.sqrt(np.mean(np.square(values))))))
+            .sort_values("rms_error", ascending=False)
+        )
+        n_frames = len(frame_scores)
+        n_max_drop = int(np.floor(n_frames * percentile / 100.0))
+
+        median_frame_rmse: float | None = None
+        upper_sigma: float | None = None
+        sigma_threshold: float | None = None
+
+        if n_max_drop < 1:
+            all_sync_indices = set(int(v) for v in frame_scores["sync_index"])
+            metadata = {
+                "mode": "median_sigma" if sigma_multiplier is not None else "percentile",
+                "total_frames": int(n_frames),
+                "percentile_cap": float(percentile),
+                "max_drop_frames": int(n_max_drop),
+                "candidate_drop_frames": 0,
+                "planned_drop_frames": 0,
+                "actual_drop_frames": 0,
+                "actual_drop_percent": 0.0,
+                "restored_for_min_per_camera": 0,
+            }
+            return all_sync_indices, set(), metadata
+
+        if sigma_multiplier is None:
+            drop_candidates = frame_scores.head(n_max_drop)
+            candidate_drop_frames = int(n_max_drop)
+        else:
+            rms_values = frame_scores["rms_error"].to_numpy(dtype=np.float64)
+            median_frame_rmse = float(np.median(rms_values))
+            upper_deviations = rms_values[rms_values >= median_frame_rmse] - median_frame_rmse
+            upper_deviations = upper_deviations[upper_deviations > 0]
+            if upper_deviations.size > 0:
+                # One-sided robust scale. The 1.4826 factor matches MAD's normal-consistent scale.
+                upper_sigma = float(np.median(upper_deviations) * 1.4826)
+            else:
+                upper_sigma = 0.0
+            if upper_sigma <= 1e-12 and rms_values.size > 1:
+                upper_sigma = float(np.std(rms_values, ddof=1))
+            sigma_threshold = median_frame_rmse + sigma_multiplier * upper_sigma
+            drop_candidates = frame_scores[frame_scores["rms_error"] > sigma_threshold].head(n_max_drop)
+            candidate_drop_frames = int((frame_scores["rms_error"] > sigma_threshold).sum())
+
+        initial_drop_sync_indices = set(int(v) for v in drop_candidates["sync_index"])
+        drop_sync_indices = set(initial_drop_sync_indices)
+        keep_sync_indices = set(int(v) for v in frame_scores[~frame_scores["sync_index"].isin(drop_sync_indices)]["sync_index"])
+
+        # Safety: restore the lowest-error dropped frames until every posed camera
+        # keeps at least min_per_camera observations.
+        img_df = self.image_points.df
+        dropped_best_first = frame_scores[frame_scores["sync_index"].isin(drop_sync_indices)].sort_values(
+            "rms_error", ascending=True
+        )
+        for cam_id in self.camera_array.posed_cameras.keys():
+            n_keep = int(((img_df["cam_id"] == cam_id) & img_df["sync_index"].isin(keep_sync_indices)).sum())
+            if n_keep >= min_per_camera:
+                continue
+            for sync_index in dropped_best_first["sync_index"]:
+                sync_index = int(sync_index)
+                if sync_index in keep_sync_indices:
+                    continue
+                keep_sync_indices.add(sync_index)
+                drop_sync_indices.discard(sync_index)
+                n_keep = int(((img_df["cam_id"] == cam_id) & img_df["sync_index"].isin(keep_sync_indices)).sum())
+                if n_keep >= min_per_camera:
+                    break
+
+        restored_count = len(initial_drop_sync_indices) - len(drop_sync_indices)
+        metadata = {
+            "mode": "median_sigma" if sigma_multiplier is not None else "percentile",
+            "total_frames": int(n_frames),
+            "percentile_cap": float(percentile),
+            "max_drop_frames": int(n_max_drop),
+            "candidate_drop_frames": int(candidate_drop_frames),
+            "planned_drop_frames": int(len(initial_drop_sync_indices)),
+            "actual_drop_frames": int(len(drop_sync_indices)),
+            "actual_drop_percent": float((len(drop_sync_indices) / n_frames) * 100.0) if n_frames > 0 else 0.0,
+            "restored_for_min_per_camera": int(restored_count),
+            "sigma_multiplier": float(sigma_multiplier) if sigma_multiplier is not None else None,
+            "median_frame_rmse": median_frame_rmse,
+            "upper_sigma": upper_sigma,
+            "sigma_threshold": sigma_threshold,
+        }
+        return keep_sync_indices, drop_sync_indices, metadata
+
+    def describe_sync_index_error_filter(
+        self,
+        percentile: float,
+        min_per_camera: int = 10,
+        sigma_multiplier: float | None = None,
+    ) -> dict[str, Any]:
+        """Return metadata for the sync_index frame filter without applying it."""
+        _, _, metadata = self._select_sync_index_filter_frames(percentile, min_per_camera, sigma_multiplier)
+        return metadata
+
+    def filter_by_sync_index_percentile_error(
+        self,
+        percentile: float,
+        min_per_camera: int = 10,
+        sigma_multiplier: float | None = None,
+    ) -> CaptureVolume:
+        """Remove the worst synchronized frames by reprojection RMS error.
+
+        This is frame-level filtering: if a sync_index is selected for removal, all
+        observations from every camera at that sync_index are removed together.
+        It is intentionally capped at 30% to avoid making the calibration look
+        artificially good by discarding too much temporal coverage.
+
+        If sigma_multiplier is provided, only frames above median + N * robust
+        upper sigma are eligible for removal. The percentile still acts as the
+        maximum number of synchronized frames that can be removed.
+        """
+        keep_sync_indices, drop_sync_indices, _ = self._select_sync_index_filter_frames(
+            percentile,
+            min_per_camera,
+            sigma_multiplier,
+        )
+        if not drop_sync_indices:
+            return self
+
+        img_df = self.image_points.df
+        filtered_img_df = img_df[img_df["sync_index"].isin(keep_sync_indices)].copy().reset_index(drop=True)
+        filtered_image_points = ImagePoints(filtered_img_df)
+
+        filtered_world_df = (
+            self.world_points.df[self.world_points.df["sync_index"].isin(keep_sync_indices)].copy().reset_index(drop=True)
+        )
+        filtered_world_points = WorldPoints(filtered_world_df)
+
+        return CaptureVolume(
+            camera_array=self.camera_array,
+            image_points=filtered_image_points,
+            world_points=filtered_world_points,
+        )
 
     def compute_volumetric_scale_accuracy(self) -> VolumetricScaleReport:
         """Compute multi-frame scale accuracy across the capture volume.
