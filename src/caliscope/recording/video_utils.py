@@ -1,14 +1,15 @@
 """Video file utilities.
 
-Functions for reading video metadata without full frame decoding.
-Uses PyAV for container inspection -- no frames are decoded.
+Functions for reading video metadata without full frame decoding. Uses OpenCV
+with display-orientation auto-rotation disabled so reported dimensions match the
+encoded raster coordinate system used by calibration.
 """
 
 import logging
 from pathlib import Path
 from typing import TypedDict
 
-import av
+import cv2
 
 logger = logging.getLogger(__name__)
 
@@ -23,65 +24,58 @@ class VideoProperties(TypedDict):
     size: tuple[int, int]
 
 
-def read_video_properties(source_path: Path) -> VideoProperties:
-    """Read video metadata (fps, frame_count, dimensions) via PyAV.
+def _open_video_capture_no_auto_rotation(source_path: Path) -> cv2.VideoCapture:
+    """Open a VideoCapture in encoded-raster coordinates.
 
-    Opens the video container briefly to inspect stream metadata,
-    then closes it. No frames are decoded.
-
-    Falls back to duration-based frame count when the container
-    does not report stream.frames (same logic as FrameSource.frame_count).
-
-    Raises:
-        FileNotFoundError: If source_path does not exist.
-        ValueError: If the file cannot be opened as video, has no video
-            stream, or if fps/frame_count cannot be determined. All PyAV
-            exceptions are wrapped as ValueError to preserve the caller
-            contract.
+    GoPro MP4 files may carry display-rotation metadata. OpenCV applies that
+    metadata by default on this platform, which changes the pixel coordinate
+    system for 90-degree files and center-rotates 180-degree files. Calibration
+    intrinsics are stored in encoded 1920x1080 coordinates, so all pipeline reads
+    must disable auto-rotation explicitly.
     """
     if not source_path.exists():
         raise FileNotFoundError(f"Video file not found: {source_path}")
 
-    logger.info(f"Reading video properties from: {source_path}")
-
-    try:
-        container = av.open(str(source_path))
-    except Exception as e:
+    capture = cv2.VideoCapture(str(source_path))
+    if not capture.isOpened():
+        capture.release()
         raise ValueError(
-            f"Could not open video file: {source_path}. The file may be corrupted or in an unsupported format."
-        ) from e
+            f"Could not open video file: {source_path}. "
+            "The file may be corrupted or in an unsupported format."
+        )
 
+    if hasattr(cv2, "CAP_PROP_ORIENTATION_AUTO"):
+        capture.set(cv2.CAP_PROP_ORIENTATION_AUTO, 0)
+
+    return capture
+
+
+def read_video_properties(source_path: Path) -> VideoProperties:
+    """Read video metadata (fps, frame_count, dimensions) via OpenCV.
+
+    Opens the video briefly to inspect stream metadata, then closes it. No full
+    frame scan is performed.
+
+    Raises:
+        FileNotFoundError: If source_path does not exist.
+        ValueError: If the file cannot be opened as video or metadata cannot be
+            determined.
+    """
+    logger.info(f"Reading video properties from: {source_path}")
+    capture = _open_video_capture_no_auto_rotation(source_path)
     try:
-        if not container.streams.video:
-            raise ValueError(f"No video stream found in: {source_path}")
+        fps = float(capture.get(cv2.CAP_PROP_FPS))
+        if fps <= 0:
+            raise ValueError(f"Could not determine frame rate for: {source_path}")
 
-        stream = container.streams.video[0]
-
-        # FPS from average_rate (rational number, e.g. 30000/1001)
-        if stream.average_rate is None or float(stream.average_rate) <= 0:
-            raise ValueError(
-                f"Could not determine frame rate for: {source_path}. "
-                f"The video file may be corrupted or in an unsupported format."
-            )
-        fps = float(stream.average_rate)
-
-        # Frame count: prefer stream metadata, fall back to duration * fps
-        # This matches FrameSource.frame_count (metadata estimate), not
-        # FrameSource.last_frame_index (keyframe-scan result).
-        frame_count = stream.frames
-        if frame_count == 0 and container.duration is not None:
-            duration_seconds = container.duration / 1_000_000
-            frame_count = int(duration_seconds * fps)
-
+        frame_count = int(round(capture.get(cv2.CAP_PROP_FRAME_COUNT)))
         if frame_count <= 0:
-            raise ValueError(
-                f"Could not determine frame count for: {source_path}. "
-                f"stream.frames={stream.frames}, "
-                f"container.duration={container.duration}"
-            )
+            raise ValueError(f"Could not determine frame count for: {source_path}")
 
-        width = stream.width
-        height = stream.height
+        width = int(round(capture.get(cv2.CAP_PROP_FRAME_WIDTH)))
+        height = int(round(capture.get(cv2.CAP_PROP_FRAME_HEIGHT)))
+        if width <= 0 or height <= 0:
+            raise ValueError(f"Could not determine dimensions for: {source_path}")
 
         return VideoProperties(
             fps=fps,
@@ -91,4 +85,4 @@ def read_video_properties(source_path: Path) -> VideoProperties:
             size=(width, height),
         )
     finally:
-        container.close()
+        capture.release()

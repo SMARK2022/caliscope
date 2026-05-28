@@ -98,8 +98,8 @@ def extract_image_points(
 ) -> ImagePoints:
     """Extract 2D landmark observations from a single camera video.
 
-    Opens the video with PyAV, runs the tracker frame-by-frame, and assembles
-    results into a validated ImagePoints DataFrame.
+    Opens the video with OpenCV auto-rotation disabled, runs the tracker on the
+    selected frames, and assembles results into a validated ImagePoints DataFrame.
 
     Args:
         video_path: Path to the video file.
@@ -116,9 +116,8 @@ def extract_image_points(
         FileNotFoundError: If the video path does not exist.
         ValueError: If frame_step < 1.
     """
-    import av
     import pandas as pd
-    from caliscope.recording.video_utils import read_video_properties
+    from caliscope.recording.frame_source import FrameSource
 
     if frame_step < 1:
         raise ValueError(f"frame_step must be >= 1, got {frame_step}")
@@ -132,12 +131,8 @@ def extract_image_points(
 
         rotation_count = 0
 
-        container = av.open(str(video_path))
-        video_stream = container.streams.video[0]
-        time_base = float(video_stream.time_base) if video_stream.time_base is not None else 0.0
-
-        props = read_video_properties(video_path)
-        frame_count = props["frame_count"]
+        frame_source = FrameSource.from_path(video_path, cam_id=cam_id)
+        frame_count = frame_source.frame_count
         # Progress total reflects frames that will actually be processed
         progress_total = (frame_count + frame_step - 1) // frame_step
 
@@ -148,13 +143,14 @@ def extract_image_points(
             progress.on_video_start(cam_id, progress_total)
 
         try:
-            progress_index = 0
-            for frame_index, frame in enumerate(container.decode(video_stream)):
-                if frame_index % frame_step != 0:
+            for progress_index, frame_index in enumerate(range(0, frame_count, frame_step), start=1):
+                bgr = frame_source.read_frame_at(frame_index)
+                if bgr is None:
+                    if progress is not None:
+                        progress.on_frame(cam_id, progress_index, 0)
                     continue
 
-                bgr = frame.to_ndarray(format="bgr24")
-                frame_time = frame.pts * time_base if frame.pts is not None else 0.0
+                frame_time = frame_index / frame_source.fps
 
                 point_packet = tracker.get_points(bgr, cam_id=cam_id, rotation_count=rotation_count)
 
@@ -174,11 +170,10 @@ def extract_image_points(
                     }
                     all_rows.append(row)
 
-                progress_index += 1
                 if progress is not None:
                     progress.on_frame(cam_id, progress_index, n_points)
         finally:
-            container.close()
+            frame_source.close()
 
         if progress is not None:
             progress.on_video_complete(cam_id)

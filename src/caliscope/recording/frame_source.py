@@ -1,40 +1,20 @@
 """Raw frame access for recorded video files.
 
 FrameSource provides synchronous frame reading and seeking with no threading,
-queues, or tracking. It wraps PyAV for efficient video decoding.
-
-This is infrastructure (I/O), not domain logic - hence placement in recording/
-rather than core/.
-
-PyAV/FFmpeg Quirks (lessons learned):
--------------------------------------
-1. **PTS-to-frame-index calculation**: Must use `round()` not `int()`.
-   The formula `frame.pts * time_base * fps` has floating point precision
-   issues that cause `int()` to truncate incorrectly near frame boundaries.
-   Example: PTS 285696 * time_base * fps = 557.8125 → int() gives 557, but
-   round() correctly gives 558.
-
-2. **Metadata frame count vs actual frames**: The container's frame count
-   (from duration or stream.frames) may not match actually accessible frames.
-   We scan keyframes at init to find the true last accessible frame index.
-
-3. **skip_frame="NONKEY" corrupts decoder state**: After using skip_frame
-   to scan keyframes, non-keyframe decoding fails silently. The container
-   must be closed and reopened to restore normal behavior.
-
-4. **Seeking near EOF**: PyAV's seek can fail silently near end of video,
-   especially with B-frame encoded content. The keyframe index helps us
-   know which frames are actually reachable.
+queues, or tracking. It wraps OpenCV's VideoCapture for fast decoding while
+explicitly disabling display-orientation metadata so decoded frames stay in the
+encoded raster coordinate system used by calibration intrinsics.
 """
 
 import logging
 from pathlib import Path
 from threading import Lock
-from typing import Iterator, Self
+from typing import Self
 
-import av
+import cv2
 import numpy as np
-from av.video.frame import VideoFrame
+
+from caliscope.recording.video_utils import _open_video_capture_no_auto_rotation
 
 logger = logging.getLogger(__name__)
 
@@ -50,9 +30,15 @@ class FrameSource:
     Typical usage: one owner thread, or explicit external synchronization.
 
     Note: get_frame() and get_nearest_keyframe() invalidate the sequential read
-    position. After calling either, read_frame() behavior is undefined until
-    the internal iterator is naturally exhausted or a new FrameSource is created.
+    position. Use a fresh FrameSource for predictable mixed random/sequential
+    access.
     """
+
+    # Decode forward instead of re-seeking for moderate positive jumps. For the
+    # calibration path this preserves the intended seek-first + sequential-grab
+    # behavior when frame_step is 5/10/30 while avoiding long accidental scans.
+    _MIN_SEQUENTIAL_GRAB_THRESHOLD = 30
+    _SEQUENTIAL_GRAB_SECONDS = 4.0
 
     def __init__(self, video_directory: Path, cam_id: int) -> None:
         """Open a video file for frame access.
@@ -73,17 +59,7 @@ class FrameSource:
         """Construct a FrameSource from an explicit video file path.
 
         Bypasses the video_directory / cam_N.mp4 naming convention used by
-        __init__. All other initialization (keyframe scan, metadata validation)
-        runs identically.
-
-        Args:
-            video_path: Absolute path to the video file.
-            cam_id: Optional camera identifier for diagnostic logging.
-                Defaults to 0 if not provided (no semantic meaning here).
-
-        Raises:
-            FileNotFoundError: If video_path does not exist.
-            ValueError: If the video stream lacks required metadata.
+        __init__.
         """
         resolved_cam_id = cam_id if cam_id is not None else 0
         instance = cls.__new__(cls)
@@ -91,58 +67,53 @@ class FrameSource:
         return instance
 
     def _open(self, video_path: Path, cam_id: int) -> None:
-        """Shared initialization body for __init__ and from_path.
-
-        Sets all instance attributes. Must be called exactly once per instance
-        (no re-entrancy guard — callers are __init__ and from_path).
-        """
+        """Shared initialization body for __init__ and from_path."""
         self.cam_id = cam_id
         self.video_path = video_path
 
-        if not self.video_path.exists():
-            raise FileNotFoundError(f"Video file not found: {self.video_path}")
-
-        self._container = av.open(str(self.video_path))
-        self._video_stream = self._container.streams.video[0]
+        self._container = _open_video_capture_no_auto_rotation(self.video_path)
         self._lock = Lock()
-        self._frame_iterator: Iterator[VideoFrame] | None = None
 
-        # Validate stream metadata
-        if self._video_stream.time_base is None:
-            raise ValueError(f"Video stream has no time_base: {self.video_path}")
-        if self._video_stream.average_rate is None:
-            raise ValueError(f"Video stream has no average_rate: {self.video_path}")
+        fps = float(self._container.get(cv2.CAP_PROP_FPS))
+        if fps <= 0:
+            self._container.release()
+            raise ValueError(f"Video stream has no valid FPS: {self.video_path}")
+        self.fps = fps
 
-        self._time_base = float(self._video_stream.time_base)
-        self.fps = float(self._video_stream.average_rate)
-        self.size = (self._video_stream.width, self._video_stream.height)
+        width = int(round(self._container.get(cv2.CAP_PROP_FRAME_WIDTH)))
+        height = int(round(self._container.get(cv2.CAP_PROP_FRAME_HEIGHT)))
+        if width <= 0 or height <= 0:
+            self._container.release()
+            raise ValueError(f"Video stream has invalid dimensions: {self.video_path}")
+        self.size = (width, height)
 
-        # Build keyframe index and find actual last frame
-        # This solves PyAV/FFmpeg issues where metadata frame count doesn't match
-        # accessible frames via seeking (especially near EOF with B-frames)
-        self._keyframe_pts: list[int] = []
+        metadata_frame_count = int(round(self._container.get(cv2.CAP_PROP_FRAME_COUNT)))
+        if metadata_frame_count <= 0:
+            self._container.release()
+            raise ValueError(f"Video stream has no frame count: {self.video_path}")
+
         self._keyframe_indices: list[int] = []
-        self._actual_last_frame_index = self._build_frame_index()
+        self._keyframe_pts: list[int] = []
+        self._actual_last_frame_index = self._find_last_accessible_frame(metadata_frame_count)
+        self.frame_count = self._actual_last_frame_index + 1
 
-        # frame_count from metadata (may differ from actual accessible frames)
-        frame_count = self._video_stream.frames
-        if frame_count == 0 and self._container.duration is not None:
-            duration_seconds = self._container.duration / 1_000_000
-            frame_count = int(duration_seconds * self.fps)
-        self.frame_count = frame_count
+        self._sequential_position: int = -1
+        self._sequential_grab_threshold = max(
+            self._MIN_SEQUENTIAL_GRAB_THRESHOLD,
+            int(round(self.fps * self._SEQUENTIAL_GRAB_SECONDS)),
+        )
+        self._reset_to_start()
 
         logger.debug(
-            f"FrameSource for cam_id {cam_id}: metadata says {frame_count} frames, "
-            f"actual last accessible frame is {self._actual_last_frame_index}, "
-            f"found {len(self._keyframe_pts)} keyframes"
+            "FrameSource for cam_id %s: OpenCV metadata says %s frames, "
+            "actual last accessible frame is %s, size=%s, fps=%s",
+            cam_id,
+            metadata_frame_count,
+            self._actual_last_frame_index,
+            self.size,
+            self.fps,
         )
 
-        # Sequential read state for read_frame_at()
-        self._sequential_position: int = -1  # frame index of last decoded frame
-        self._sequential_iterator: Iterator[VideoFrame] | None = None
-
-        # Mark as successfully initialized - must be last line of _open
-        # If _open fails, _closed won't exist and __del__ won't warn
         self._closed = False
 
     @property
@@ -152,280 +123,125 @@ class FrameSource:
 
     @property
     def last_frame_index(self) -> int:
-        """Last valid frame index (actual accessible frame, not metadata estimate)."""
+        """Last accessible frame index."""
         return self._actual_last_frame_index
 
-    def _build_frame_index(self) -> int:
-        """Scan video to build keyframe index and find actual last frame.
-
-        Uses skip_frame="NONKEY" to quickly iterate keyframes only.
-        Records keyframe positions for potential future use in smarter seeking.
-
-        Returns:
-            Actual last accessible frame index.
-
-        Note:
-            Called during __init__ before _container could be set to None.
-            Reopens container after scan because skip_frame corrupts decoder state.
-        """
-        # Container is guaranteed valid here - called from __init__ after open
+    def _find_last_accessible_frame(self, metadata_frame_count: int) -> int:
+        """Probe near the metadata frame count to avoid full-video scans."""
         assert self._container is not None
+        last_candidate = metadata_frame_count - 1
+        # Most MP4s report the correct last frame. Probe a small window for the
+        # occasional container that overstates accessibility near EOF.
+        max_backoff = min(metadata_frame_count, 120)
+        for offset in range(max_backoff):
+            frame_index = last_candidate - offset
+            if frame_index < 0:
+                break
+            if self._read_exact_frame_locked(frame_index) is not None:
+                return frame_index
+        return max(0, last_candidate)
 
-        # Set decoder to skip non-keyframes for fast scanning
-        self._video_stream.codec_context.skip_frame = "NONKEY"
+    def _reset_to_start(self) -> None:
+        if self._container is not None:
+            self._container.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        self._sequential_position = -1
 
-        max_frame_idx = 0
-        try:
-            for frame in self._container.decode(self._video_stream):
-                if frame.pts is None:
-                    continue
-                frame_idx = round(frame.pts * self._time_base * self.fps)
-                self._keyframe_pts.append(frame.pts)
-                self._keyframe_indices.append(frame_idx)
-                max_frame_idx = max(max_frame_idx, frame_idx)
-        except Exception as e:
-            logger.warning(f"Error during keyframe scan: {e}")
-
-        # Close and reopen container - skip_frame corrupts decoder state
-        # such that non-keyframes become inaccessible after scanning
-        self._container.close()
-        self._container = av.open(str(self.video_path))
-        self._video_stream = self._container.streams.video[0]
-        self._frame_iterator = None
-
-        # Find actual last accessible frame by seeking from last keyframe
-        # The last keyframe may not be the last accessible frame
-        if self._keyframe_indices:
-            last_keyframe = self._keyframe_indices[-1]
-            target_pts = int(last_keyframe / self.fps / self._time_base)
-            self._container.seek(target_pts, stream=self._video_stream)
-
-            # Decode forward from last keyframe to find true last frame
-            for frame in self._container.decode(self._video_stream):
-                if frame.pts is None:
-                    continue
-                frame_idx = round(frame.pts * self._time_base * self.fps)
-                max_frame_idx = max(max_frame_idx, frame_idx)
-
-            # Reset to beginning for normal use
-            self._container.seek(0, stream=self._video_stream)
-
-        return max_frame_idx
+    def _read_exact_frame_locked(self, frame_index: int) -> np.ndarray | None:
+        """Seek to a frame and read it. Caller must hold the lock when public."""
+        if self._container is None:
+            return None
+        if not self._container.set(cv2.CAP_PROP_POS_FRAMES, frame_index):
+            return None
+        ok, frame = self._container.read()
+        if not ok or frame is None:
+            return None
+        self._sequential_position = frame_index
+        return frame
 
     def get_frame(self, frame_index: int) -> np.ndarray | None:
         """Seek to exact frame and return it as BGR numpy array.
 
-        Uses PyAV's seek to nearest keyframe, then decodes forward to exact frame.
-        O(keyframe_distance) complexity for compressed video.
-
-        Args:
-            frame_index: Target frame index to retrieve.
-
-        Returns:
-            Frame as BGR numpy array, or None if frame_index is out of bounds,
-            seek fails, or frame not found.
+        Uses OpenCV VideoCapture with orientation auto-rotation disabled.
 
         Note:
-            Invalidates sequential read position. After calling this method,
-            read_frame() behavior is undefined.
+            Invalidates sequential read position.
         """
         with self._lock:
             if self._container is None:
                 return None
-
-            # Bounds check - prevent PyAV's wrap-around behavior
             if frame_index < 0 or frame_index > self.last_frame_index:
                 return None
-
-            # Convert frame index to PTS (presentation timestamp)
-            target_pts = int(frame_index / self.fps / self._time_base)
-            self._container.seek(target_pts, stream=self._video_stream)
-
-            # Decode frames until we reach or pass the target
-            for frame in self._container.decode(self._video_stream):
-                if frame.pts is None:
-                    continue  # Skip frames without PTS
-                frame_idx = round(frame.pts * self._time_base * self.fps)
-                if frame_idx >= frame_index:
-                    return frame.to_ndarray(format="bgr24")
-
-            return None
+            return self._read_exact_frame_locked(frame_index)
 
     def read_frame_at(self, frame_index: int) -> np.ndarray | None:
         """Read frame at index, optimizing for sequential access patterns.
 
-        Maintains internal position tracking. When the requested frame is
-        at or just ahead of the current position, decodes forward
-        sequentially (O(1) per frame). When it is far ahead or behind,
-        falls back to seek-based access.
+        Cold starts and large jumps seek directly to the target. Moderate
+        positive gaps decode forward with ``grab()`` and one ``read()``, which is
+        substantially faster than repeated seeking on GoPro H.265 files.
 
-        Not protected by self._lock — designed for single-owner access
-        in the parallel processing pipeline (one FrameSource per camera
-        per thread).
-
-        Args:
-            frame_index: Target frame index.
-
-        Returns:
-            BGR numpy array, or None if out of bounds or decode fails.
+        Not protected by self._lock -- designed for single-owner access in the
+        parallel processing pipeline (one FrameSource per camera per thread).
         """
         if frame_index < 0 or frame_index > self.last_frame_index:
             return None
-
         if self._container is None:
             return None
 
-        # Compute average GOP and decode-forward threshold
-        if self._keyframe_indices:
-            avg_gop = max(1, self._actual_last_frame_index // max(1, len(self._keyframe_indices)))
-        else:
-            avg_gop = 30  # default assumption
-        threshold = avg_gop // 2
-
         gap = frame_index - self._sequential_position
+        if 0 < gap <= self._sequential_grab_threshold:
+            current_pos = int(round(self._container.get(cv2.CAP_PROP_POS_FRAMES)))
+            expected_pos = self._sequential_position + 1
+            if current_pos == expected_pos:
+                for _ in range(max(0, gap - 1)):
+                    if not self._container.grab():
+                        return None
+                ok, frame = self._container.read()
+                if not ok or frame is None:
+                    return None
+                self._sequential_position = frame_index
+                return frame
 
-        # Fast path: next frame in sequence
-        if gap == 1 and self._sequential_iterator is not None:
-            try:
-                frame = next(self._sequential_iterator)
-                if frame.pts is not None:
-                    decoded_idx = round(frame.pts * self._time_base * self.fps)
-                    if decoded_idx == frame_index:
-                        self._sequential_position = frame_index
-                        return frame.to_ndarray(format="bgr24")
-                    else:
-                        logger.warning(
-                            f"PTS mismatch on fast path: expected {frame_index}, got {decoded_idx}. "
-                            "Falling back to seek."
-                        )
-                        # Fall through to seek path
-            except StopIteration:
-                pass  # Fall through to seek path
-
-        # Small-gap path: decode forward through the gap
-        elif 1 < gap <= threshold and self._sequential_iterator is not None:
-            try:
-                result_frame: VideoFrame | None = None
-                frames_decoded = 0
-                # We need to advance (gap) frames from current position
-                for frame in self._sequential_iterator:
-                    if frame.pts is None:
-                        continue
-                    decoded_idx = round(frame.pts * self._time_base * self.fps)
-                    frames_decoded += 1
-                    if decoded_idx == frame_index:
-                        result_frame = frame
-                        break
-                    elif decoded_idx > frame_index:
-                        # Overshot — PTS mismatch, fall through to seek
-                        logger.warning(
-                            f"Overshot target {frame_index} (got {decoded_idx}) on small-gap path. "
-                            "Falling back to seek."
-                        )
-                        result_frame = None
-                        break
-                    # else: decoded_idx < frame_index, keep advancing
-
-                if result_frame is not None:
-                    self._sequential_position = frame_index
-                    return result_frame.to_ndarray(format="bgr24")
-                # Fall through to seek path if we didn't find the target
-            except StopIteration:
-                pass  # Fall through to seek path
-
-        # Seek path: large jump, backward, cold start, or fallback from above paths
-        target_pts = int(frame_index / self.fps / self._time_base)
-        self._container.seek(target_pts, stream=self._video_stream)
-
-        new_iterator = self._container.decode(self._video_stream)
-        for frame in new_iterator:
-            if frame.pts is None:
-                continue
-            decoded_idx = round(frame.pts * self._time_base * self.fps)
-            if decoded_idx >= frame_index:
-                self._sequential_position = decoded_idx
-                self._sequential_iterator = new_iterator
-                return frame.to_ndarray(format="bgr24")
-
-        return None
+        return self._read_exact_frame_locked(frame_index)
 
     def get_nearest_keyframe(self, frame_index: int) -> tuple[np.ndarray | None, int]:
-        """Seek to nearest keyframe at or before target.
+        """Return a frame suitable for fast scrubbing.
 
-        Fast seeking for scrubbing - returns the keyframe at or before target,
-        without decoding forward to the exact frame. O(1) complexity for
-        compressed video.
-
-        Args:
-            frame_index: Target frame index (will return keyframe at or before).
-
-        Returns:
-            Tuple of (frame_data, actual_frame_index).
-            - frame_data: BGR numpy array, or None if out of bounds or seek fails.
-            - actual_frame_index: Index of returned frame, or -1 if out of bounds
-              or seek fails.
-
-        Note:
-            Invalidates sequential read position. After calling this method,
-            read_frame() behavior is undefined.
+        OpenCV does not expose portable keyframe-index access through
+        VideoCapture, so this backend returns the requested frame itself. The
+        public contract remains the same: a BGR frame and its actual index, or
+        ``(None, -1)`` on invalid input/failure.
         """
         with self._lock:
             if self._container is None:
                 return None, -1
-
-            # Bounds check - prevent PyAV's wrap-around behavior
             if frame_index < 0 or frame_index > self.last_frame_index:
                 return None, -1
-
-            # Convert frame index to PTS (presentation timestamp)
-            target_pts = int(frame_index / self.fps / self._time_base)
-            self._container.seek(target_pts, stream=self._video_stream)
-
-            # Return the first frame after seek (the keyframe)
-            for frame in self._container.decode(self._video_stream):
-                if frame.pts is None:
-                    continue
-                actual_idx = round(frame.pts * self._time_base * self.fps)
-                return frame.to_ndarray(format="bgr24"), actual_idx
-
-            return None, -1
+            frame = self._read_exact_frame_locked(frame_index)
+            if frame is None:
+                return None, -1
+            return frame, frame_index
 
     def read_frame(self) -> np.ndarray | None:
-        """Read next frame sequentially, returning BGR numpy array or None at EOF.
-
-        Creates a new iterator on first call. Subsequent calls return frames
-        in sequence until EOF.
-
-        Returns:
-            Frame as BGR numpy array, or None at end of file.
-
-        Note:
-            Position is undefined after get_frame() or get_nearest_keyframe() calls.
-            For predictable sequential reading, use a fresh FrameSource or
-            read all frames without seeking.
-        """
+        """Read next frame sequentially, returning BGR numpy array or None at EOF."""
         with self._lock:
             if self._container is None:
                 return None
-
-            if self._frame_iterator is None:
-                self._frame_iterator = self._container.decode(self._video_stream)
-
-            try:
-                frame = next(self._frame_iterator)
-                return frame.to_ndarray(format="bgr24")
-            except StopIteration:
+            current_pos = int(round(self._container.get(cv2.CAP_PROP_POS_FRAMES)))
+            ok, frame = self._container.read()
+            if not ok or frame is None:
                 return None
+            self._sequential_position = current_pos
+            return frame
 
     def close(self) -> None:
         """Release video container resources."""
         with self._lock:
             self._closed = True
             if self._container is not None:
-                self._container.close()
-                self._container = None  # type: ignore[assignment]
+                self._container.release()
+                self._container = None
             self._sequential_position = -1
-            self._sequential_iterator = None
 
     def __enter__(self) -> Self:
         """Context manager entry."""
@@ -441,10 +257,7 @@ class FrameSource:
         self.close()
 
     def __del__(self) -> None:
-        """Destructor - warns if resources were not properly released.
-
-        If _closed doesn't exist, __init__ failed and there's nothing to warn about.
-        """
+        """Destructor - warns if resources were not properly released."""
         if not getattr(self, "_closed", True):
             logger.warning(
                 f"FrameSource for {self.video_path} was not closed properly. "

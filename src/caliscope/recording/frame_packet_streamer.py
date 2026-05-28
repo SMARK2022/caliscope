@@ -7,7 +7,7 @@ of the raw video I/O.
 Seeking and Pause Handling (lessons learned):
 ---------------------------------------------
 1. **Seek failure must not kill the streamer**: When get_frame() returns None
-   (e.g., PyAV can't decode near EOF), we must set skip_read=True to stay at
+   (e.g., the decoder can't read near EOF), we must set skip_read=True to stay at
    the current position. Otherwise, the next read_frame() call has undefined
    behavior after a seek and will likely return None, causing premature exit.
 

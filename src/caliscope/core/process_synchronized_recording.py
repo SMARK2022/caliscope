@@ -19,6 +19,7 @@ from caliscope.cameras.camera_array import CameraData
 from caliscope.core.point_data import ImagePoints
 from caliscope.packets import PointPacket
 from caliscope.recording.frame_source import FrameSource
+from caliscope.recording.video_utils import _open_video_capture_no_auto_rotation
 from caliscope.recording.synchronized_timestamps import SynchronizedTimestamps
 from caliscope.task_manager.cancellation import CancellationToken
 from caliscope.tracker import Tracker
@@ -168,8 +169,7 @@ def get_initial_thumbnails(
 ) -> dict[int, NDArray[np.uint8]]:
     """快速读取每台相机的首帧缩略图。
 
-    这里只用 PyAV 打开视频并解码第一帧，不构造 FrameSource，也不扫描 keyframe，适合
-    GUI 初始化缩略图。
+    这里只用 OpenCV 打开视频并解码第一帧，不构造 FrameSource，适合 GUI 初始化缩略图。
 
     Args:
         recording_dir: 包含 ``cam_N.mp4`` 的目录。
@@ -178,8 +178,6 @@ def get_initial_thumbnails(
     Returns:
         ``{cam_id: BGR_frame}`` 字典。
     """
-    import av
-
     thumbnails: dict[int, NDArray[np.uint8]] = {}
 
     for cam_id in cameras:
@@ -189,16 +187,13 @@ def get_initial_thumbnails(
             continue
 
         try:
-            container = av.open(str(video_path))
+            capture = _open_video_capture_no_auto_rotation(video_path)
             try:
-                stream = container.streams.video[0]
-                for frame in container.decode(stream):
-                    # bgr24 always produces uint8; PyAV stubs don't narrow the type
-                    arr: NDArray[np.uint8] = frame.to_ndarray(format="bgr24")  # type: ignore[assignment]
-                    thumbnails[cam_id] = arr
-                    break
+                ok, frame = capture.read()
+                if ok and frame is not None:
+                    thumbnails[cam_id] = frame
             finally:
-                container.close()
+                capture.release()
         except Exception as e:
             logger.warning(f"Error reading first frame for cam_id {cam_id}: {e}")
 
@@ -213,8 +208,7 @@ def _create_frame_sources(
 ) -> dict[int, FrameSource]:
     """为每台相机创建 FrameSource。
 
-    FrameSource 初始化会扫描 keyframe，属于 I/O 密集操作；这里并行初始化可以明显减少
-    多相机录制的启动时间。
+    这里并行初始化多相机视频源，避免串行打开容器拖慢启动。
 
     Args:
         recording_dir: 包含 ``cam_N.mp4`` 的目录。

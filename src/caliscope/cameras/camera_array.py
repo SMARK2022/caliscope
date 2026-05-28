@@ -318,7 +318,7 @@ class CameraArray:
     def from_video_metadata(cls, videos: Mapping[int, Path | str]) -> CameraArray:
         """Create uncalibrated CameraArray from video file metadata.
 
-        Reads resolution from each video via PyAV. No frames are decoded.
+        Reads resolution from each video via OpenCV. No frames are decoded.
         """
         from caliscope.recording.video_utils import read_video_properties
 
