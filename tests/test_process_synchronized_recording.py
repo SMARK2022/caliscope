@@ -6,10 +6,12 @@ from synchronized multi-camera video recordings.
 
 from pathlib import Path
 
+import pandas as pd
 import pytest
 
 from caliscope.cameras.camera_array import CameraArray
 from caliscope.core.charuco import Charuco
+import caliscope.core.process_synchronized_recording as process_sync_module
 from caliscope.core.process_synchronized_recording import (
     FrameData,
     get_initial_thumbnails,
@@ -163,6 +165,80 @@ class TestProcessSynchronizedRecording:
                 assert isinstance(cam_id, int)
                 assert frame_data.frame is not None
                 assert frame_data.frame.ndim == 3  # BGR image
+
+    def test_no_callback_parallel_matches_serial(self, cameras, tracker, synced_timestamps, monkeypatch):
+        """No-callback batch optimization preserves the serial extraction result.
+
+        The optimized path is intentionally limited to calls without frame/progress
+        callbacks, so this test compares it against the serial sync-major path using
+        independent trackers. Separate tracker instances avoid sharing the per-camera
+        mirror hint cache between runs; the assertion then protects the invariant that
+        only scheduling changes, never ChArUco IDs or subpixel coordinates.
+        """
+
+        serial_tracker = CharucoTracker(tracker.charuco)
+        parallel_tracker = CharucoTracker(tracker.charuco)
+        original_batch = process_sync_module._process_camera_series_batch
+        used_camera_series = False
+
+        def record_camera_series(*args, **kwargs):
+            nonlocal used_camera_series
+            used_camera_series = True
+            return original_batch(*args, **kwargs)
+
+        monkeypatch.setattr(process_sync_module, "_process_camera_series_batch", record_camera_series)
+
+        serial_points = process_synchronized_recording(
+            RECORDING_DIR,
+            cameras,
+            serial_tracker,
+            synced_timestamps,
+            subsample=100,
+            parallel=False,
+        )
+        parallel_points = process_synchronized_recording(
+            RECORDING_DIR,
+            cameras,
+            parallel_tracker,
+            synced_timestamps,
+            subsample=100,
+            parallel=True,
+        )
+
+        serial_df = serial_points.df.reset_index(drop=True)
+        parallel_df = parallel_points.df.reset_index(drop=True)
+        assert used_camera_series
+        pd.testing.assert_frame_equal(parallel_df, serial_df)
+
+    def test_non_charuco_tracker_keeps_sync_major_path(self, cameras, tracker, synced_timestamps, monkeypatch):
+        """Non-ChArUco trackers keep the original sync-major scheduling.
+
+        ``process_synchronized_recording`` accepts arbitrary Tracker subclasses, so the
+        ChArUco-only optimization must not change call ordering for other tracker types.
+        This test gives a working ChArUco detector a subclass type and fails if the
+        camera-series helper is reached; the exact built-in type check is the compatibility
+        boundary that protects custom stateful trackers.
+        """
+
+        class OtherNamedCharucoTracker(CharucoTracker):
+            @property
+            def name(self):
+                return "OTHER"
+
+        def fail_camera_series(*_args, **_kwargs):
+            raise AssertionError("camera-series path must remain ChArUco-only")
+
+        monkeypatch.setattr(process_sync_module, "_process_camera_series_batch", fail_camera_series)
+
+        image_points = process_synchronized_recording(
+            RECORDING_DIR,
+            cameras,
+            OtherNamedCharucoTracker(tracker.charuco),
+            synced_timestamps,
+            subsample=100,
+            parallel=True,
+        )
+        assert len(image_points.df) > 0
 
 
 class TestCancellation:

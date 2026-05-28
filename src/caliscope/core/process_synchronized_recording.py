@@ -6,9 +6,10 @@
 """
 
 import logging
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Event
 from typing import Callable
 
 import numpy as np
@@ -23,6 +24,7 @@ from caliscope.recording.video_utils import _open_video_capture_no_auto_rotation
 from caliscope.recording.synchronized_timestamps import SynchronizedTimestamps
 from caliscope.task_manager.cancellation import CancellationToken
 from caliscope.tracker import Tracker
+from caliscope.trackers.charuco_tracker import CharucoTracker
 
 logger = logging.getLogger(__name__)
 
@@ -51,9 +53,10 @@ def process_synchronized_recording(
 ) -> ImagePoints:
     """从已同步的多相机视频中提取二维 landmark。
 
-    函数按 sync index 遍历时间线，再为每台相机读取对应原始帧。并行模式只并行同一
-    sync index 内的不同相机，回调仍在主循环线程触发，避免 GUI/调用方处理共享状态时
-    需要额外加锁。
+    函数按 sync index 遍历时间线，再为每台相机读取对应原始帧。带回调、取消令牌或
+    非内置 ChArUco tracker 的并行模式只并行同一 sync index 内的不同相机，回调仍在
+    主循环线程触发，避免 GUI/调用方处理共享状态时需要额外加锁。无回调的内置
+    ChArUco 批处理会改为按相机连续处理，以减少调度开销；检测器和输出保持不变。
 
     Args:
         recording_dir: 包含 ``cam_N.mp4`` 的录制目录。
@@ -83,13 +86,39 @@ def process_synchronized_recording(
 
     try:
         use_pool = parallel and len(frame_sources) > 1
+        can_use_camera_series = use_pool and on_frame_data is None and on_progress is None and token is None
+        tracker_supports_camera_series = type(tracker) is CharucoTracker
+        use_camera_series = (
+            can_use_camera_series
+            and tracker_supports_camera_series
+        )
 
-        if use_pool:
+        if use_camera_series:
+            # The non-preview batch path can process each camera as one ordered series.
+            # This keeps the exact same frame reader/tracker/subpixel operations as
+            # the sync-major path while avoiding one Future allocation and one barrier per
+            # (sync_index, camera) pair. Only the exact built-in CharucoTracker type is
+            # opted in; subclasses and arbitrary Tracker implementations stay on the
+            # original sync-major path because they may depend on cross-camera call
+            # ordering or side effects at sync-index boundaries.
+            point_rows = _process_camera_series_batch(
+                all_sync_indices,
+                synced_timestamps,
+                frame_sources,
+                cameras,
+                tracker,
+                max_workers=max_workers,
+            )
+            camera_pool = None
+        elif use_pool:
             camera_pool = ThreadPoolExecutor(max_workers=_bounded_worker_count(len(frame_sources), max_workers))
         else:
             camera_pool = None
 
         try:
+            if use_camera_series:
+                return _build_image_points(point_rows)
+
             for i, sync_index in enumerate(all_sync_indices):
                 if token is not None and token.is_cancelled:
                     logger.info("Processing cancelled")
@@ -255,6 +284,115 @@ def _bounded_worker_count(item_count: int, max_workers: int | None) -> int:
     if max_workers is None:
         return item_count
     return max(1, min(item_count, max_workers))
+
+
+def _process_camera_series_batch(
+    sync_indices: list[int],
+    synced_timestamps: SynchronizedTimestamps,
+    frame_sources: dict[int, FrameSource],
+    cameras: dict[int, CameraData],
+    tracker: Tracker,
+    *,
+    max_workers: int | None,
+) -> list[dict]:
+    """按相机批处理同步帧，保留非回调批处理场景的检测结果不变。
+
+    这个路径只在没有 ``on_frame_data``、``on_progress`` 和 ``CancellationToken`` 时启用：
+    没有回调/取消边界时不需要在每个 sync index 建立 barrier，也不需要为预览构造
+    ``FrameData`` 保存每帧图像。每台相机仍然使用自己的 ``FrameSource.read_frame_at``，所以冷启动会
+    直接 seek 到第一帧，后续按该相机的递增帧序列连续解码；tracker、cornerSubPix 和输出 schema
+    与原路径一致。
+
+    Args:
+        sync_indices: 已按 subsample 选出的同步帧索引，必须保持原顺序。
+        synced_timestamps: 同步时间轴，用于把 sync index 映射回每台相机的原始帧。
+        frame_sources: 已打开的视频源，每个 cam_id 独占一个实例，不能跨相机共享。
+        cameras: 相机数据，提供 rotation_count 等 tracker 入参。
+        tracker: 与原路径相同的二维点检测器。
+        max_workers: 用户给出的 worker 上限，仍按相机数量截断。
+
+    Returns:
+        与 sync-major 路径相同字段的行字典列表，并按 sync/camera 排序以保持输出顺序
+        稳定；同一相机同一帧内的 corner 顺序仍由 tracker 决定，不在这里重排。
+    """
+
+    point_rows: list[dict] = []
+    worker_count = _bounded_worker_count(len(frame_sources), max_workers)
+    pool = ThreadPoolExecutor(max_workers=worker_count)
+    stop_event = Event()
+    futures: list[Future[list[dict]]] = []
+    try:
+        for cam_id in synced_timestamps.cam_ids:
+            if cam_id not in frame_sources or cam_id not in cameras:
+                continue
+            futures.append(
+                pool.submit(
+                    _process_one_camera_series,
+                    cam_id,
+                    sync_indices,
+                    synced_timestamps,
+                    frame_sources[cam_id],
+                    cameras[cam_id],
+                    tracker,
+                    stop_event,
+                )
+            )
+
+        for future in as_completed(futures):
+            point_rows.extend(future.result())
+    except Exception:
+        # Once a camera future reports a tracker/video exception, ask still-running
+        # workers to stop at their next sync boundary and join them before FrameSource
+        # objects are closed by the outer finally. Workers that already completed before
+        # the failed future was observed are left as-is; pending work is cancelled.
+        stop_event.set()
+        pool.shutdown(wait=True, cancel_futures=True)
+        raise
+    else:
+        pool.shutdown(wait=True)
+
+    # Camera-series workers complete by camera, not by sync index. Sorting is cheap
+    # relative to video decode/detection and restores the original loop nesting
+    # (sync first, camera second) without changing the tracker-provided corner order.
+    point_rows.sort(key=lambda row: (row["sync_index"], row["cam_id"]))
+    return point_rows
+
+
+def _process_one_camera_series(
+    cam_id: int,
+    sync_indices: list[int],
+    synced_timestamps: SynchronizedTimestamps,
+    frame_source: FrameSource,
+    camera: CameraData,
+    tracker: Tracker,
+    stop_event: Event,
+) -> list[dict]:
+    """处理单台相机的一整段递增同步帧序列。
+
+    这里不构造 ``FrameData``，因为无回调批处理不会把原始帧交给调用方；除此之外仍使用
+    与原路径相同的 ``read_frame_at``、``tracker.get_points`` 和 ``_accumulate_points``，确保
+    只改变调度粒度，不改变 ChArUco 检测、镜像尝试、亚像素细化或行数据展开规则。
+    """
+
+    local_rows: list[dict] = []
+    for sync_index in sync_indices:
+        if stop_event.is_set():
+            break
+
+        frame_index = synced_timestamps.frame_for(sync_index, cam_id)
+        if frame_index is None:
+            continue
+
+        frame = frame_source.read_frame_at(frame_index)
+        if frame is None:
+            logger.warning(f"Failed to read frame: sync={sync_index}, cam_id={cam_id}, frame_index={frame_index}")
+            continue
+
+        points = tracker.get_points(frame, cam_id, camera.rotation_count)
+        frame_time = synced_timestamps.time_for(cam_id, frame_index)
+        _accumulate_points(local_rows, sync_index, cam_id, frame_index, frame_time, points)
+
+    return local_rows
 
 
 def _accumulate_points(

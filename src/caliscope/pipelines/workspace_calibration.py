@@ -1321,6 +1321,8 @@ def _extract_or_load_extrinsic_points(
         frame_step,
         max_workers,
     )
+    progress_callback = on_progress if show_progress else None
+
     try:
         image_points = process_synchronized_recording(
             recording_dir=extrinsic_dir,
@@ -1330,7 +1332,7 @@ def _extract_or_load_extrinsic_points(
             subsample=frame_step,
             parallel=parallel,
             max_workers=max_workers,
-            on_progress=on_progress,
+            on_progress=progress_callback,
         )
     finally:
         if progress_bar is not None:
