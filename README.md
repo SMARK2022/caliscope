@@ -56,6 +56,7 @@ PYTHONUNBUFFERED=1 \
             ├── cam_N.mp4                               # 输入：外参视频，命名必须是 cam_N.mp4
             ├── timestamps.csv                          # 自动生成/可复用：音频同步时间线
             ├── sync_offsets.toml                       # 自动生成/可复用：音频同步摘要
+            ├── 📁optitrack_alignment_12d               # 可选：world_points 与 OptiTrack 的 12D 坐标系对齐
             ├── 📁CHARUCO
             │   ├── image_points.csv                    # 自动生成/可复用：同步 ChArUco 2D 点
             │   └── image_points.meta.toml              # 自动生成/可复用：抽点 cache manifest
@@ -112,6 +113,45 @@ PYTHONUNBUFFERED=1 \
 ```
 
 只想查看哪些阶段会复用或重算时，在同一模板中加入 `--plan-only`。
+
+### 5.1 可选 OptiTrack 12D 坐标系对齐
+
+外参完成并写出 `capture_volume/world_points.csv` 后，可以在同一次 workflow 中追加 OptiTrack/Motive CSV 对齐。该阶段不改变相机外参，只新增坐标系转换输出并把摘要写入 `calibration_report.toml`。
+
+```bash
+PATH="/home/btsun/.conda/envs/cali/bin:$PATH" \
+PYTHONPATH="/home/btsun/project/Calibration/dependencies/caliscope/src" \
+PYTHONUNBUFFERED=1 \
+/home/btsun/.conda/envs/cali/bin/python -u -m caliscope.pipelines.workspace_calibration \
+  --workspace <workspace> \
+  --intrinsics-library /home/btsun/project/Calibration/intrinsics_library.toml \
+  --read-metadata --no-source-cam-id-fallback \
+  --filter-scope overall --filter-percentile 10 --filter-sigma 2 \
+  --optitrack-csv /home/btsun/project/Calibration/src/mocap_rgb_projection/data/calibration-5-21.csv \
+  --optitrack-lambda-xy-list "0,0.1,0.2,0.5,1,10,100" \
+  --optitrack-select-lambda 0.2 \
+  --no-progress --log-level INFO
+```
+
+默认输出目录：
+
+```text
+calibration/extrinsic/optitrack_alignment_12d
+```
+
+主要输出：
+
+| 文件 | 作用 |
+| --- | --- |
+| `alignment_transform_12d_summary.json` | 完整 12D offset、时间偏移、Sim(3) 正反变换、误差和输入来源。 |
+| `alignment_transform_summary.json` | 与上面相同，兼容旧 downstream 文件名。 |
+| `transform_only.json` | downstream 更方便读取的最小变换接口。 |
+| `fit_comparison_summary.csv` | `lambda_xy` sweep 的 train/test/all 误差。 |
+| `aligned_point_errors.csv` | 每个内角点的 3D 对齐误差。 |
+| `alignment_frame_error_summary.csv` | 每帧 RMSE/p95/max。 |
+| `calibration_report.toml` 的 `[optitrack_alignment]` | workflow 汇总：RMSE、`lambda_xy`、时间偏移、输出路径。 |
+
+当前推荐 `--optitrack-select-lambda 0.2`。使用输出变换时，普通 OptiTrack 点只应使用全局 Sim(3) 与时间偏移；`marker_corner_local_offsets_*` 只描述该标定板四个 marker 中心到纸面角点的局部修正，不应套到其他物体。
 
 ## 6. 完整阶段说明
 

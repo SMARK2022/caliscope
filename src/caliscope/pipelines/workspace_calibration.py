@@ -78,6 +78,7 @@ class WorkspaceCalibrationConfig:
         max_nfev: 每轮 SciPy least_squares 最大函数评估次数。
         scipy_verbose: SciPy 优化器日志级别。
         align_to_object: 是否把最终坐标系对齐到某一帧 ChArUco 板。
+        optitrack_csv: 可选 Motive/OptiTrack CSV；提供时在外参完成后运行 12D 坐标系对齐。
         plan_only: 只打印复用/重算计划，不写入标定结果。
         allow_partial_extrinsics: 允许外参图不完整时继续保存 partial 结果。
     """
@@ -105,6 +106,24 @@ class WorkspaceCalibrationConfig:
     max_nfev: int = 1000
     scipy_verbose: int = 0
     align_to_object: bool = False
+    optitrack_csv: Path | None = None
+    optitrack_alignment_output_dir: Path | None = None
+    optitrack_lambda_xy_list: str = "0,0.1,0.2,0.5,1,10,100"
+    optitrack_select_lambda: str = "0.2"
+    optitrack_offset_min: float = -20.0
+    optitrack_offset_max: float = 20.0
+    optitrack_coarse_offset_step: float = 0.25
+    optitrack_max_world_grid_rmse_m: float = 0.005
+    optitrack_min_points_per_fit_frame: int = 15
+    optitrack_min_overlap_frames: int = 40
+    optitrack_max_coarse_frames: int = 120
+    optitrack_top_candidates_to_refine: int = 8
+    optitrack_equal_height_maxiter: int = 260
+    optitrack_offset_12d_maxiter: int = 500
+    optitrack_allow_global_scale: bool = True
+    optitrack_test_ratio: float = 0.33
+    optitrack_seed: int = 20260521
+    optitrack_write_plots: bool = True
     plan_only: bool = False
     allow_partial_extrinsics: bool = False
 
@@ -222,6 +241,7 @@ def run_workspace_calibration(config: WorkspaceCalibrationConfig) -> dict[str, A
                 "recalibrations": intrinsic_recalibrations,
             },
             "stage_plan": stage_plan,
+            "optitrack_alignment": _optitrack_alignment_plan(config, extrinsic_dir, capture_volume_dir),
         }
 
     sync_report = _synchronize_extrinsic_recording(extrinsic_dir, cam_ids, reuse_existing=reuse_sync)
@@ -273,6 +293,7 @@ def run_workspace_calibration(config: WorkspaceCalibrationConfig) -> dict[str, A
 
     capture_volume.camera_array.to_toml(workspace / "camera_array.toml")
     capture_volume.camera_array.to_aniposelib_toml(workspace / "camera_array_aniposelib.toml")
+    optitrack_alignment_report = _run_optitrack_alignment_stage(config, extrinsic_dir, capture_volume_dir)
 
     run_report = {
         "pipeline_schema_version": 1,
@@ -297,6 +318,7 @@ def run_workspace_calibration(config: WorkspaceCalibrationConfig) -> dict[str, A
         "sync": sync_report,
         "extrinsic_points": _summarize_image_points(image_points),
         "capture_volume": capture_report,
+        "optitrack_alignment": optitrack_alignment_report,
         "outputs": {
             "camera_array": str(workspace / "camera_array.toml"),
             "camera_array_aniposelib": str(workspace / "camera_array_aniposelib.toml"),
@@ -306,6 +328,11 @@ def run_workspace_calibration(config: WorkspaceCalibrationConfig) -> dict[str, A
             "run_report": str(capture_volume_dir / "calibration_report.toml"),
         },
     }
+    if optitrack_alignment_report.get("enabled"):
+        outputs = optitrack_alignment_report.get("outputs", {})
+        run_report["outputs"]["optitrack_alignment_dir"] = optitrack_alignment_report["output_dir"]
+        if isinstance(outputs, dict):
+            run_report["outputs"].update({f"optitrack_{key}": value for key, value in outputs.items()})
     _safe_write_toml(_toml_clean(run_report), capture_volume_dir / "calibration_report.toml")
     logger.info("Calibration complete. Overall reprojection RMSE: %.4f px", capture_report["final_rmse"])
     return run_report
@@ -347,6 +374,131 @@ def _validate_config(config: WorkspaceCalibrationConfig, workspace: Path, intrin
         raise ValueError("opencv_threads must be >= 1")
     if config.scipy_verbose not in (0, 1, 2):
         raise ValueError("scipy_verbose must be 0, 1, or 2")
+    if config.optitrack_csv is not None:
+        optitrack_csv = config.optitrack_csv.expanduser().resolve()
+        if not optitrack_csv.exists():
+            raise FileNotFoundError(f"OptiTrack CSV not found: {optitrack_csv}")
+        _parse_float_csv(config.optitrack_lambda_xy_list, "optitrack_lambda_xy_list")
+        if config.optitrack_select_lambda not in {"min_test", "min_all"}:
+            float(config.optitrack_select_lambda)
+        if config.optitrack_offset_min >= config.optitrack_offset_max:
+            raise ValueError("optitrack_offset_min must be < optitrack_offset_max")
+        if config.optitrack_coarse_offset_step <= 0:
+            raise ValueError("optitrack_coarse_offset_step must be positive")
+        if config.optitrack_max_world_grid_rmse_m <= 0:
+            raise ValueError("optitrack_max_world_grid_rmse_m must be positive")
+        if config.optitrack_min_points_per_fit_frame < 3:
+            raise ValueError("optitrack_min_points_per_fit_frame must be >= 3")
+        if config.optitrack_min_overlap_frames < 3:
+            raise ValueError("optitrack_min_overlap_frames must be >= 3")
+        if config.optitrack_max_coarse_frames < 1:
+            raise ValueError("optitrack_max_coarse_frames must be >= 1")
+        if config.optitrack_top_candidates_to_refine < 1:
+            raise ValueError("optitrack_top_candidates_to_refine must be >= 1")
+        if config.optitrack_equal_height_maxiter < 1:
+            raise ValueError("optitrack_equal_height_maxiter must be >= 1")
+        if config.optitrack_offset_12d_maxiter < 1:
+            raise ValueError("optitrack_offset_12d_maxiter must be >= 1")
+        if not (0 <= config.optitrack_test_ratio < 1):
+            raise ValueError("optitrack_test_ratio must be in [0, 1)")
+
+
+def _parse_float_csv(value: str, field_name: str) -> list[float]:
+    """解析逗号分隔浮点数配置。"""
+
+    values = [float(item.strip()) for item in value.split(",") if item.strip()]
+    if not values:
+        raise ValueError(f"{field_name} must contain at least one value")
+    return values
+
+
+def _optitrack_alignment_output_dir(config: WorkspaceCalibrationConfig, extrinsic_dir: Path) -> Path:
+    if config.optitrack_alignment_output_dir is not None:
+        return config.optitrack_alignment_output_dir.expanduser().resolve()
+    return extrinsic_dir / "optitrack_alignment_12d"
+
+
+def _optitrack_alignment_plan(
+    config: WorkspaceCalibrationConfig,
+    extrinsic_dir: Path,
+    capture_volume_dir: Path,
+) -> dict[str, Any]:
+    """返回 OptiTrack 对齐阶段的计划/禁用状态。"""
+
+    if config.optitrack_csv is None:
+        return {"enabled": False}
+    return {
+        "enabled": True,
+        "world_points": str(capture_volume_dir / "world_points.csv"),
+        "optitrack_csv": str(config.optitrack_csv.expanduser().resolve()),
+        "output_dir": str(_optitrack_alignment_output_dir(config, extrinsic_dir)),
+        "lambda_xy_list": config.optitrack_lambda_xy_list,
+        "select_lambda": config.optitrack_select_lambda,
+        "allow_global_scale": config.optitrack_allow_global_scale,
+    }
+
+
+def _run_optitrack_alignment_stage(
+    config: WorkspaceCalibrationConfig,
+    extrinsic_dir: Path,
+    capture_volume_dir: Path,
+) -> dict[str, Any]:
+    """可选运行 12D OptiTrack/world_points 坐标系对齐。"""
+
+    plan = _optitrack_alignment_plan(config, extrinsic_dir, capture_volume_dir)
+    if not plan["enabled"]:
+        return plan
+    world_points_csv = capture_volume_dir / "world_points.csv"
+    if not world_points_csv.exists():
+        raise FileNotFoundError(f"world_points.csv not found for OptiTrack alignment: {world_points_csv}")
+
+    from caliscope.pipelines.optitrack_alignment_12d import OptitrackAlignmentConfig, run_optitrack_alignment_12d
+
+    output_dir = _optitrack_alignment_output_dir(config, extrinsic_dir)
+    transform = run_optitrack_alignment_12d(
+        OptitrackAlignmentConfig(
+            world_points_csv=world_points_csv,
+            optitrack_csv=config.optitrack_csv.expanduser().resolve(),
+            output_dir=output_dir,
+            offset_min=config.optitrack_offset_min,
+            offset_max=config.optitrack_offset_max,
+            coarse_offset_step=config.optitrack_coarse_offset_step,
+            lambda_xy_list=config.optitrack_lambda_xy_list,
+            select_lambda=config.optitrack_select_lambda,
+            test_ratio=config.optitrack_test_ratio,
+            seed=config.optitrack_seed,
+            max_world_grid_rmse_m=config.optitrack_max_world_grid_rmse_m,
+            min_points_per_fit_frame=config.optitrack_min_points_per_fit_frame,
+            min_overlap_frames=config.optitrack_min_overlap_frames,
+            max_coarse_frames=config.optitrack_max_coarse_frames,
+            top_candidates_to_refine=config.optitrack_top_candidates_to_refine,
+            equal_height_maxiter=config.optitrack_equal_height_maxiter,
+            offset_12d_maxiter=config.optitrack_offset_12d_maxiter,
+            allow_global_scale=config.optitrack_allow_global_scale,
+            write_plots=config.optitrack_write_plots,
+        )
+    )
+    error_summary = transform.get("fit_error_all_refit", {})
+    report = {
+        **plan,
+        "status": "completed",
+        "schema_version": transform.get("schema_version"),
+        "model_type": transform.get("model_type"),
+        "chosen_lambda_xy": transform.get("chosen_lambda_xy"),
+        "time_offset_seconds": transform.get("time_offset_seconds"),
+        "scale_opti_to_camera_world": transform.get("scale_opti_to_camera_world"),
+        "rmse_mm": None if "rmse_m" not in error_summary else float(error_summary["rmse_m"]) * 1000.0,
+        "mean_error_mm": None if "mean_m" not in error_summary else float(error_summary["mean_m"]) * 1000.0,
+        "p95_error_mm": None if "p95_m" not in error_summary else float(error_summary["p95_m"]) * 1000.0,
+        "outputs": {
+            "alignment_transform_12d_summary": str(output_dir / "alignment_transform_12d_summary.json"),
+            "alignment_transform_summary": str(output_dir / "alignment_transform_summary.json"),
+            "transform_only": str(output_dir / "transform_only.json"),
+            "report": str(output_dir / "REPORT.md"),
+        },
+    }
+    logger.info("OptiTrack alignment complete. RMSE: %.4f mm", report["rmse_mm"])
+    return report
 
 
 def _configure_runtime(config: WorkspaceCalibrationConfig, *, camera_count: int) -> dict[str, Any]:
@@ -1923,7 +2075,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--filter-scope",
         choices=("per_camera", "overall", "sync_index"),
         default="per_camera",
-        help="How to filter outliers after first BA; sync_index removes whole synchronized frames and is capped at 30%",
+        help="How to filter outliers after first BA; sync_index removes whole synchronized frames and is capped at 30%%",
     )
     parser.add_argument(
         "--filter-sigma",
@@ -1937,6 +2089,43 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-nfev", type=int, default=1000, help="Maximum function evaluations per BA pass")
     parser.add_argument("--scipy-verbose", type=int, default=0, choices=(0, 1, 2), help="SciPy least_squares verbosity")
     parser.add_argument("--align-to-object", action="store_true", help="Align final volume to a visible Charuco board frame")
+    parser.add_argument(
+        "--optitrack-csv",
+        type=Path,
+        default=None,
+        help="Optional Motive/OptiTrack CSV; enables 12D world_points-to-OptiTrack alignment after extrinsic calibration",
+    )
+    parser.add_argument(
+        "--optitrack-alignment-output-dir",
+        type=Path,
+        default=None,
+        help="Output directory for 12D OptiTrack alignment; defaults to calibration/extrinsic/optitrack_alignment_12d",
+    )
+    parser.add_argument(
+        "--optitrack-lambda-xy-list",
+        default="0,0.1,0.2,0.5,1,10,100",
+        help="Comma-separated lambda_xy values for 12D marker offset regularization",
+    )
+    parser.add_argument("--optitrack-select-lambda", default="0.2", help="Numeric lambda, min_test, or min_all")
+    parser.add_argument("--optitrack-offset-min", type=float, default=-20.0, help="Minimum time offset search bound in seconds")
+    parser.add_argument("--optitrack-offset-max", type=float, default=20.0, help="Maximum time offset search bound in seconds")
+    parser.add_argument("--optitrack-coarse-offset-step", type=float, default=0.25, help="Coarse time offset grid step in seconds")
+    parser.add_argument(
+        "--optitrack-max-world-grid-rmse-m",
+        type=float,
+        default=0.005,
+        help="Maximum per-frame 5x3 world grid fit RMSE used for OptiTrack alignment",
+    )
+    parser.add_argument("--optitrack-min-points-per-fit-frame", type=int, default=15, help="Minimum world_points in each fit frame")
+    parser.add_argument("--optitrack-min-overlap-frames", type=int, default=40, help="Minimum overlapping frames for alignment")
+    parser.add_argument("--optitrack-max-coarse-frames", type=int, default=120, help="Maximum frames used in coarse seed search")
+    parser.add_argument("--optitrack-top-candidates-to-refine", type=int, default=8, help="Equal-height seed candidates to refine")
+    parser.add_argument("--optitrack-equal-height-maxiter", type=int, default=260, help="Nelder-Mead iterations for equal-height seed")
+    parser.add_argument("--optitrack-offset-12d-maxiter", type=int, default=500, help="L-BFGS-B iterations for 12D offsets")
+    parser.add_argument("--optitrack-allow-global-scale", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--optitrack-test-ratio", type=float, default=0.33, help="Train/test split ratio for lambda comparison")
+    parser.add_argument("--optitrack-seed", type=int, default=20260521, help="Random seed for train/test split")
+    parser.add_argument("--optitrack-write-plots", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--plan-only", action="store_true", help="Print planned reuse/recompute stages and exit")
     parser.add_argument(
         "--allow-partial-extrinsics",
@@ -1988,6 +2177,24 @@ def main(argv: list[str] | None = None) -> int:
         max_nfev=args.max_nfev,
         scipy_verbose=args.scipy_verbose,
         align_to_object=args.align_to_object,
+        optitrack_csv=args.optitrack_csv,
+        optitrack_alignment_output_dir=args.optitrack_alignment_output_dir,
+        optitrack_lambda_xy_list=args.optitrack_lambda_xy_list,
+        optitrack_select_lambda=args.optitrack_select_lambda,
+        optitrack_offset_min=args.optitrack_offset_min,
+        optitrack_offset_max=args.optitrack_offset_max,
+        optitrack_coarse_offset_step=args.optitrack_coarse_offset_step,
+        optitrack_max_world_grid_rmse_m=args.optitrack_max_world_grid_rmse_m,
+        optitrack_min_points_per_fit_frame=args.optitrack_min_points_per_fit_frame,
+        optitrack_min_overlap_frames=args.optitrack_min_overlap_frames,
+        optitrack_max_coarse_frames=args.optitrack_max_coarse_frames,
+        optitrack_top_candidates_to_refine=args.optitrack_top_candidates_to_refine,
+        optitrack_equal_height_maxiter=args.optitrack_equal_height_maxiter,
+        optitrack_offset_12d_maxiter=args.optitrack_offset_12d_maxiter,
+        optitrack_allow_global_scale=args.optitrack_allow_global_scale,
+        optitrack_test_ratio=args.optitrack_test_ratio,
+        optitrack_seed=args.optitrack_seed,
+        optitrack_write_plots=args.optitrack_write_plots,
         plan_only=args.plan_only,
         allow_partial_extrinsics=args.allow_partial_extrinsics,
     )
