@@ -5,16 +5,16 @@ from __future__ import annotations
 import argparse
 import csv
 import itertools
-import json
 import logging
 import math
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Sequence
 
 import numpy as np
 import pandas as pd
+import rtoml
 from scipy.optimize import minimize
 
 logger = logging.getLogger(__name__)
@@ -31,6 +31,10 @@ EXPECTED_POINT_IDS = tuple(range(INNER_GRID_COLS * INNER_GRID_ROWS))
 MARKER_TYPE_PRIORITY = ("Rigid Body Marker", "Marker")
 RANDOM_SEED = 20260521
 TARGET_RMSE_MM = 3.0
+OUTPUT_BASENAME = "optitrack_to_camera_world_alignment"
+ALIGNMENT_TOML_NAME = f"{OUTPUT_BASENAME}.toml"
+REPORT_MD_NAME = f"{OUTPUT_BASENAME}_report.md"
+DIAGNOSTICS_DIR_NAME = "diagnostics"
 
 
 @dataclass(frozen=True)
@@ -60,7 +64,6 @@ class OptitrackAlignmentConfig:
     equal_height_maxiter: int = 260
     offset_12d_maxiter: int = 500
     allow_global_scale: bool = True
-    write_plots: bool = True
 
 
 @dataclass(frozen=True)
@@ -81,7 +84,6 @@ class Candidate:
     n_frames: int
     n_points: int
     scale: float
-    stage: str
 
 
 @dataclass(frozen=True)
@@ -526,7 +528,7 @@ def equal_height_candidate_rmse(
     return float(np.sqrt(np.mean(errors**2))), int(len(source)), int(n_frames), float(scale)
 
 
-def optimize_equal_height_seed(records: list[WorldFrame], opti: pd.DataFrame, config: OptitrackAlignmentConfig) -> tuple[Candidate, list[Candidate]]:
+def optimize_equal_height_seed(records: list[WorldFrame], opti: pd.DataFrame, config: OptitrackAlignmentConfig) -> Candidate:
     coarse_records = sample_records(records, config.max_coarse_frames)
     offsets = np.arange(config.offset_min, config.offset_max + config.coarse_offset_step * 0.5, config.coarse_offset_step)
     heights = np.linspace(config.shared_height_min, config.shared_height_max, config.coarse_height_count)
@@ -561,7 +563,6 @@ def optimize_equal_height_seed(records: list[WorldFrame], opti: pd.DataFrame, co
                     n_frames,
                     n_points,
                     scale,
-                    "coarse_equal_height",
                 )
                 if best_for_perm is None or candidate.rmse_m < best_for_perm.rmse_m:
                     best_for_perm = candidate
@@ -600,9 +601,7 @@ def optimize_equal_height_seed(records: list[WorldFrame], opti: pd.DataFrame, co
             allow_scale=config.allow_global_scale,
             min_overlap_frames=config.min_overlap_frames,
         )
-        refined_results.append(
-            Candidate(seed.permutation, offset_s, marker_height_m, rmse_m, n_frames, n_points, scale, "refined_equal_height")
-        )
+        refined_results.append(Candidate(seed.permutation, offset_s, marker_height_m, rmse_m, n_frames, n_points, scale))
 
     if not refined_results:
         raise RuntimeError("Equal-height seed search did not produce any refined candidates")
@@ -616,7 +615,7 @@ def optimize_equal_height_seed(records: list[WorldFrame], opti: pd.DataFrame, co
         best.rmse_m * 1000.0,
         best.scale,
     )
-    return best, [*coarse_results, *refined_results]
+    return best
 
 
 def parse_lambda_list(text: str) -> list[float]:
@@ -753,26 +752,6 @@ def select_result(results: list[OffsetFitResult], select_lambda: str) -> OffsetF
     return min(results, key=lambda result: abs(result.lambda_xy - value))
 
 
-def candidate_frame(candidates: Iterable[Candidate]) -> pd.DataFrame:
-    rows = []
-    for candidate in candidates:
-        rows.append(
-            {
-                "stage": candidate.stage,
-                "permutation_raw_marker_indices_for_p00_p10_p11_p01": str(candidate.permutation),
-                "offset_s": candidate.offset_s,
-                "marker_height_m": candidate.marker_height_m,
-                "marker_height_mm": candidate.marker_height_m * 1000.0,
-                "rmse_m": candidate.rmse_m,
-                "rmse_mm": candidate.rmse_m * 1000.0,
-                "n_frames": candidate.n_frames,
-                "n_points": candidate.n_points,
-                "scale": candidate.scale,
-            }
-        )
-    return pd.DataFrame(rows).sort_values(["rmse_m", "stage"], kind="stable")
-
-
 def result_frame(results: list[OffsetFitResult]) -> pd.DataFrame:
     rows = []
     for result in results:
@@ -798,47 +777,39 @@ def result_frame(results: list[OffsetFitResult]) -> pd.DataFrame:
     return pd.DataFrame(rows).sort_values("lambda_xy")
 
 
-def offsets_frame(result: OffsetFitResult) -> pd.DataFrame:
-    rows = []
-    for i, offset in enumerate(result.offsets_4x3_m):
-        rows.append(
-            {
-                "corner_id": i,
-                "dx_m": offset[0],
-                "dy_m": offset[1],
-                "dz_m": offset[2],
-                "dx_mm": offset[0] * 1000.0,
-                "dy_mm": offset[1] * 1000.0,
-                "dz_mm": offset[2] * 1000.0,
-            }
-        )
-    return pd.DataFrame(rows)
+def diagnostic_output_paths(out_dir: Path) -> dict[str, Path]:
+    diagnostics_dir = out_dir / DIAGNOSTICS_DIR_NAME
+    return {
+        "point_errors": diagnostics_dir / f"{OUTPUT_BASENAME}_point_errors.csv",
+        "frame_errors": diagnostics_dir / f"{OUTPUT_BASENAME}_frame_errors.csv",
+    }
 
 
-def write_world_quality(out_dir: Path, frames: list[WorldFrame], fit_frames: list[WorldFrame]) -> None:
-    fit_sync_indexes = {frame.sync_index for frame in fit_frames}
-    rows = [
-        {
-            "sync_index": frame.sync_index,
-            "frame_time": frame.frame_time,
-            "n_points": int(len(frame.point_ids)),
-            "world_grid_fit_rmse_m": frame.grid_rmse_m,
-            "world_grid_fit_rmse_mm": frame.grid_rmse_m * 1000.0,
-            "used_for_fit": int(frame.sync_index in fit_sync_indexes),
-        }
-        for frame in frames
-    ]
-    pd.DataFrame(rows).sort_values("frame_time").to_csv(out_dir / "world_points_frame_quality.csv", index=False)
+def summarize_world_quality(frames: list[WorldFrame], fit_frames: list[WorldFrame]) -> dict[str, float | int]:
+    grid_rmse_mm = np.asarray([frame.grid_rmse_m * 1000.0 for frame in fit_frames], dtype=np.float64)
+    all_points = sum(len(frame.point_ids) for frame in frames)
+    fit_points = sum(len(frame.point_ids) for frame in fit_frames)
+    return {
+        "frames_total": int(len(frames)),
+        "frames_used_for_fit": int(len(fit_frames)),
+        "points_total": int(all_points),
+        "points_used_for_fit": int(fit_points),
+        "fit_frame_grid_rmse_mean_mm": float(np.mean(grid_rmse_mm)),
+        "fit_frame_grid_rmse_median_mm": float(np.median(grid_rmse_mm)),
+        "fit_frame_grid_rmse_p95_mm": float(np.quantile(grid_rmse_mm, 0.95)),
+    }
 
 
 def write_error_tables(out_dir: Path, final_fit: TransformFit) -> dict[str, float | int]:
+    paths = diagnostic_output_paths(out_dir)
+    paths["point_errors"].parent.mkdir(parents=True, exist_ok=True)
     rows = final_fit.meta.copy()
     rows["pred_camera_world_x"] = final_fit.predicted_points[:, 0]
     rows["pred_camera_world_y"] = final_fit.predicted_points[:, 1]
     rows["pred_camera_world_z"] = final_fit.predicted_points[:, 2]
     rows["error_m"] = final_fit.errors_m
     rows["error_mm"] = final_fit.errors_m * 1000.0
-    rows.to_csv(out_dir / "aligned_point_errors.csv", index=False)
+    rows.to_csv(paths["point_errors"], index=False)
 
     frame_rows = []
     for sync_index, group in rows.groupby("sync_index", sort=True):
@@ -857,193 +828,93 @@ def write_error_tables(out_dir: Path, final_fit: TransformFit) -> dict[str, floa
                 "world_grid_rmse_mm": float(group["world_grid_rmse_mm"].iloc[0]),
             }
         )
-    pd.DataFrame(frame_rows).sort_values("frame_time").to_csv(out_dir / "alignment_frame_error_summary.csv", index=False)
-
-    point_rows = []
-    for point_id, group in rows.groupby("point_id", sort=True):
-        summary = summarize_errors(group["error_m"].to_numpy(dtype=np.float64))
-        point_rows.append(
-            {
-                "point_id": int(point_id),
-                "n": int(summary["n"]),
-                "mean_error_mm": summary["mean_m"] * 1000.0,
-                "rmse_error_mm": summary["rmse_m"] * 1000.0,
-                "median_error_mm": summary["median_m"] * 1000.0,
-                "p95_error_mm": summary["p95_m"] * 1000.0,
-                "max_error_mm": summary["max_m"] * 1000.0,
-            }
-        )
-    pd.DataFrame(point_rows).to_csv(out_dir / "alignment_point_id_error_summary.csv", index=False)
+    pd.DataFrame(frame_rows).sort_values("frame_time").to_csv(paths["frame_errors"], index=False)
     return summarize_errors(final_fit.errors_m)
 
 
-def write_plots(out_dir: Path, final_fit: TransformFit, comparison_df: pd.DataFrame) -> list[str]:
-    try:
-        import matplotlib.pyplot as plt
-    except Exception as exc:  # pragma: no cover - optional plotting dependency
-        logger.info("matplotlib unavailable, skipping plots: %s", exc)
-        return []
-
-    plots_dir = out_dir / "plots"
-    plots_dir.mkdir(parents=True, exist_ok=True)
-    paths: list[str] = []
-
-    errors_mm = final_fit.errors_m * 1000.0
-    fig, ax = plt.subplots(figsize=(8, 4.5))
-    ax.hist(errors_mm, bins=70, alpha=0.85)
-    ax.axvline(float(np.sqrt(np.mean(errors_mm**2))), linestyle="--", label="RMSE")
-    ax.set_xlabel("3D error (mm)")
-    ax.set_ylabel("count")
-    ax.set_title("Point-wise 12D alignment error")
-    ax.legend()
-    fig.tight_layout()
-    path = plots_dir / "point_error_histogram.png"
-    fig.savefig(path, dpi=160)
-    plt.close(fig)
-    paths.append(str(path))
-
-    frame_df = pd.read_csv(out_dir / "alignment_frame_error_summary.csv")
-    fig, ax = plt.subplots(figsize=(10, 4.5))
-    ax.plot(frame_df["frame_time"], frame_df["rmse_error_mm"], linewidth=1.1)
-    ax.axhline(TARGET_RMSE_MM, linestyle="--", linewidth=1.0, label=f"{TARGET_RMSE_MM:.1f} mm")
-    ax.set_xlabel("world_points frame time (s)")
-    ax.set_ylabel("frame RMSE (mm)")
-    ax.set_title("Frame-wise 12D alignment RMSE")
-    ax.legend()
-    fig.tight_layout()
-    path = plots_dir / "frame_rmse_over_time.png"
-    fig.savefig(path, dpi=160)
-    plt.close(fig)
-    paths.append(str(path))
-
-    fig, ax = plt.subplots(figsize=(8, 4.5))
-    ax.plot(comparison_df["lambda_xy"], comparison_df["train_rmse_mm"], marker="o", label="train")
-    if comparison_df["test_rmse_mm"].notna().any():
-        ax.plot(comparison_df["lambda_xy"], comparison_df["test_rmse_mm"], marker="o", label="test")
-    ax.plot(comparison_df["lambda_xy"], comparison_df["all_rmse_mm"], marker="o", label="all")
-    ax.set_xscale("symlog", linthresh=0.1)
-    ax.set_xlabel("lambda_xy")
-    ax.set_ylabel("RMSE (mm)")
-    ax.set_title("12D offset regularization sweep")
-    ax.legend()
-    fig.tight_layout()
-    path = plots_dir / "lambda_sweep_rmse.png"
-    fig.savefig(path, dpi=160)
-    plt.close(fig)
-    paths.append(str(path))
-    return paths
-
-
-def write_transform_only_json(out_dir: Path, transform: dict[str, Any]) -> None:
-    keys = [
-        "schema_version",
-        "model_type",
-        "units",
-        "convention",
-        "time_offset_seconds",
-        "scale_opti_to_camera_world",
-        "R_opti_to_camera_world",
-        "t_opti_to_camera_world_m",
-        "inverse_scale_camera_world_to_opti",
-        "R_camera_world_to_opti",
-        "t_camera_world_to_opti_m",
-        "fit_error_all_refit",
-    ]
-    slim = {key: transform[key] for key in keys if key in transform}
-    (out_dir / "transform_only.json").write_text(json.dumps(slim, indent=2), encoding="utf-8")
-
-
-def write_transform_json(
+def write_alignment_toml(
     out_dir: Path,
-    world_points_csv: Path,
-    optitrack_csv: Path,
-    marker_columns: dict[str, str],
     chosen: OffsetFitResult,
     final_fit: TransformFit,
-    error_summary: dict[str, float | int],
-    equal_height_seed: Candidate,
-    train_count: int,
-    test_count: int,
 ) -> dict[str, Any]:
     inverse_scale, inverse_rotation, inverse_translation = inverse_similarity(final_fit.scale, final_fit.rotation, final_fit.translation)
-    transform: dict[str, Any] = {
-        "schema_version": 2,
-        "model_type": "optitrack_world_points_12d_marker_offsets_sim3",
-        "units": {"length": "meter", "time": "second", "angle": "radian-free direction cosine matrix"},
-        "source_world_points_csv": str(world_points_csv),
-        "source_optitrack_csv": str(optitrack_csv),
-        "optitrack_marker_columns": marker_columns,
-        "convention": {
-            "time_alignment": "opti_time_seconds = world_points_frame_time_seconds + time_offset_seconds",
-            "marker_permutation": "permutation maps [p00,p10,p11,p01] to raw marker indices [Marker001..Marker004]",
-            "local_12d_offsets": "corner_i = raw_marker_i + dx_i*e_x + dy_i*e_y + dz_i*e_z",
-            "optitrack_to_camera_world": "X_camera_world = scale * R_opti_to_camera_world @ X_opti_12d_corrected + t",
-            "final_transform_scope": "scale/R/t are fitted after applying 12D local marker offsets to board markers",
+    document: dict[str, Any] = {
+        "schema_version": 1,
+        "alignment_model": "optitrack_to_camera_world_with_12d_board_marker_offsets",
+        "time_offset_seconds": float(chosen.offset_s),
+        "optitrack_to_camera_world": {
+            "scale": float(final_fit.scale),
+            "rotation_matrix": final_fit.rotation.tolist(),
+            "translation_m": final_fit.translation.tolist(),
         },
-        "board_model": {
+        "camera_world_to_optitrack": {
+            "scale": float(inverse_scale),
+            "rotation_matrix": inverse_rotation.tolist(),
+            "translation_m": inverse_translation.tolist(),
+        },
+        "calibration_board_marker_correction": {
+            "corner_names": ["p00", "p10", "p11", "p01"],
+            "raw_marker_indices_for_corners": list(chosen.permutation),
+            "corner_local_offsets_m": chosen.offsets_4x3_m.tolist(),
+        },
+        "calibration_board": {
             "square_size_m": SQUARE_SIZE_M,
             "board_squares_cols_rows": [BOARD_SQUARE_COLS, BOARD_SQUARE_ROWS],
             "board_size_m": [BOARD_WIDTH_M, BOARD_HEIGHT_M],
             "inner_grid_cols_rows": [INNER_GRID_COLS, INNER_GRID_ROWS],
             "expected_point_ids": list(EXPECTED_POINT_IDS),
         },
-        "data_split": {"train_frames": int(train_count), "test_frames": int(test_count)},
-        "equal_height_seed": {
-            "offset_s": equal_height_seed.offset_s,
-            "marker_height_m": equal_height_seed.marker_height_m,
-            "marker_height_mm": equal_height_seed.marker_height_m * 1000.0,
-            "rmse_m": equal_height_seed.rmse_m,
-            "rmse_mm": equal_height_seed.rmse_m * 1000.0,
-            "scale": equal_height_seed.scale,
-        },
-        "chosen_lambda_xy": chosen.lambda_xy,
-        "time_offset_seconds": chosen.offset_s,
-        "marker_permutation_raw_indices_for_p00_p10_p11_p01": list(chosen.permutation),
-        "marker_corner_local_offsets_m": chosen.offsets_4x3_m.tolist(),
-        "marker_corner_local_offsets_mm": (chosen.offsets_4x3_m * 1000.0).tolist(),
-        "marker_offset_summary": {
-            "xy_rms_m": chosen.xy_rms_m,
-            "xy_rms_mm": chosen.xy_rms_m * 1000.0,
-            "z_mean_m": chosen.z_mean_m,
-            "z_mean_mm": chosen.z_mean_m * 1000.0,
-            "z_std_m": chosen.z_std_m,
-            "z_std_mm": chosen.z_std_m * 1000.0,
-        },
-        "scale_opti_to_camera_world": final_fit.scale,
-        "R_opti_to_camera_world": final_fit.rotation.tolist(),
-        "t_opti_to_camera_world_m": final_fit.translation.tolist(),
-        "inverse_scale_camera_world_to_opti": inverse_scale,
-        "R_camera_world_to_opti": inverse_rotation.tolist(),
-        "t_camera_world_to_opti_m": inverse_translation.tolist(),
-        "rotation_determinant": float(np.linalg.det(final_fit.rotation)),
-        "orthogonality_frobenius_error": float(np.linalg.norm(final_fit.rotation.T @ final_fit.rotation - np.eye(3))),
-        "fit_error_all_refit": error_summary,
     }
-    text = json.dumps(transform, indent=2)
-    (out_dir / "alignment_transform_12d_summary.json").write_text(text, encoding="utf-8")
-    (out_dir / "alignment_transform_summary.json").write_text(text, encoding="utf-8")
-    write_transform_only_json(out_dir, transform)
-    return transform
+    (out_dir / ALIGNMENT_TOML_NAME).write_text(rtoml.dumps(document), encoding="utf-8")
+    return document
 
 
-def write_markdown_report(out_dir: Path, transform: dict[str, Any], comparison_df: pd.DataFrame, plot_paths: list[str]) -> None:
-    summary = transform["fit_error_all_refit"]
+def write_markdown_report(
+    out_dir: Path,
+    alignment: dict[str, Any],
+    comparison_df: pd.DataFrame,
+    chosen: OffsetFitResult,
+    equal_height_seed: Candidate,
+    world_quality: dict[str, float | int],
+    error_summary: dict[str, float | int],
+) -> None:
+    summary = error_summary
     rmse_mm = float(summary["rmse_m"]) * 1000.0
     status = "PASS" if rmse_mm <= TARGET_RMSE_MM else "CHECK"
-    offsets_df = pd.DataFrame(transform["marker_corner_local_offsets_mm"], columns=["dx_mm", "dy_mm", "dz_mm"])
+    offsets_mm = np.asarray(alignment["calibration_board_marker_correction"]["corner_local_offsets_m"], dtype=np.float64) * 1000.0
+    offsets_df = pd.DataFrame(offsets_mm, columns=["dx_mm", "dy_mm", "dz_mm"])
     offsets_df.insert(0, "corner", ["p00", "p10", "p11", "p01"])
+    paths = diagnostic_output_paths(out_dir)
 
     lines = [
-        "# 12D Marker Offset Alignment Report",
+        "# OptiTrack To Camera-World Alignment Report",
         "",
         "## Result",
         f"- Final all-frame refit RMSE: `{rmse_mm:.6f} mm` (`{status}`, reference target {TARGET_RMSE_MM:.1f} mm).",
-        f"- Time sync: `opti_time = world_time + {transform['time_offset_seconds']:.10f} s`.",
-        f"- Selected `lambda_xy`: `{transform['chosen_lambda_xy']}`.",
-        f"- Marker permutation `[p00,p10,p11,p01] -> raw [Marker001..004]`: `{transform['marker_permutation_raw_indices_for_p00_p10_p11_p01']}`.",
-        f"- OptiTrack -> camera-world scale: `{transform['scale_opti_to_camera_world']:.10f}`.",
+        f"- Time sync: `opti_time = world_time + {alignment['time_offset_seconds']:.10f} s`.",
+        f"- Selected `lambda_xy`: `{chosen.lambda_xy}`.",
+        f"- Marker order `[p00,p10,p11,p01] -> raw marker indices`: `{alignment['calibration_board_marker_correction']['raw_marker_indices_for_corners']}`.",
+        f"- OptiTrack -> camera-world scale: `{alignment['optitrack_to_camera_world']['scale']:.10f}`.",
         "",
-        "## 12D Offset Parameters",
+        "## Output Files",
+        f"- `{ALIGNMENT_TOML_NAME}`: clean reusable coordinate transform and board marker correction parameters.",
+        f"- `{REPORT_MD_NAME}`: human-readable quality report, including lambda sweep and marker offset tables.",
+        f"- `{paths['point_errors'].relative_to(out_dir)}`: per-observation board inner-corner 3D errors after alignment.",
+        f"- `{paths['frame_errors'].relative_to(out_dir)}`: per-frame mean/RMSE/p95/max 3D errors after alignment.",
+        "",
+        "## Transform Convention",
+        "```text",
+        "opti_time_seconds = world_points_frame_time_seconds + time_offset_seconds",
+        "X_camera_world = scale * (rotation_matrix @ X_optitrack) + translation_m",
+        "```",
+        "",
+        "## World Points Used For Fit",
+        f"- Total world_points frames: `{world_quality['frames_total']}`.",
+        f"- Frames used for alignment fit: `{world_quality['frames_used_for_fit']}`.",
+        f"- Fit-frame grid RMSE mean/median/p95: `{world_quality['fit_frame_grid_rmse_mean_mm']:.6f}` / `{world_quality['fit_frame_grid_rmse_median_mm']:.6f}` / `{world_quality['fit_frame_grid_rmse_p95_mm']:.6f}` mm.",
+        "",
+        "## Board Marker 12D Offsets",
+        "These offsets only correct this calibration board's OptiTrack marker centers to board paper corners. Do not apply them to other rigid bodies or skeleton points.",
         "| corner | dx mm | dy mm | dz mm |",
         "|---|---:|---:|---:|",
     ]
@@ -1076,23 +947,14 @@ def write_markdown_report(out_dir: Path, transform: dict[str, Any], comparison_d
                 f"{summary['p95_m'] * 1000.0:.6f} | {summary['max_m'] * 1000.0:.6f} |"
             ),
             "",
-            "## Output Files",
-            "- `alignment_transform_12d_summary.json`: full transform, 12D offsets, diagnostics, and source metadata.",
-            "- `alignment_transform_summary.json`: same content under the legacy downstream filename.",
-            "- `transform_only.json`: minimal downstream transform payload.",
-            "- `fit_comparison_summary.csv`: lambda sweep train/test/all errors.",
-            "- `marker_corner_offsets.csv`: four-corner 12D offsets.",
-            "- `aligned_point_errors.csv`: point-wise 3D errors.",
-            "- `alignment_frame_error_summary.csv`: frame-wise RMSE.",
-            "- `alignment_point_id_error_summary.csv`: point-id-wise errors.",
-            "- `equal_height_candidate_results.csv`: equal-height seed candidates.",
-            "- `world_points_frame_quality.csv`: 5x3 grid quality of each world_points frame.",
+            "## Equal-Height Seed",
+            f"- Seed offset: `{equal_height_seed.offset_s:.10f} s`.",
+            f"- Seed shared marker height: `{equal_height_seed.marker_height_m * 1000.0:.6f} mm`.",
+            f"- Seed RMSE: `{equal_height_seed.rmse_m * 1000.0:.6f} mm`.",
         ]
     )
-    if plot_paths:
-        lines.extend(["", "## Plots", *[f"- `{Path(path).relative_to(out_dir)}`" for path in plot_paths]])
     lines.append("")
-    (out_dir / "REPORT.md").write_text("\n".join(lines), encoding="utf-8")
+    (out_dir / REPORT_MD_NAME).write_text("\n".join(lines), encoding="utf-8")
 
 
 def validate_config(config: OptitrackAlignmentConfig) -> None:
@@ -1154,7 +1016,6 @@ def run_optitrack_alignment_12d(config: OptitrackAlignmentConfig) -> dict[str, A
         equal_height_maxiter=config.equal_height_maxiter,
         offset_12d_maxiter=config.offset_12d_maxiter,
         allow_global_scale=config.allow_global_scale,
-        write_plots=config.write_plots,
     )
     validate_config(config)
     config.output_dir.mkdir(parents=True, exist_ok=True)
@@ -1167,7 +1028,7 @@ def run_optitrack_alignment_12d(config: OptitrackAlignmentConfig) -> dict[str, A
         config.min_points_per_fit_frame,
         config.min_overlap_frames,
     )
-    write_world_quality(config.output_dir, world_frames, fit_frames)
+    world_quality = summarize_world_quality(world_frames, fit_frames)
     logger.info(
         "world frames=%d fit_frames=%d mean_grid_rmse=%.3fmm",
         len(world_frames),
@@ -1179,15 +1040,13 @@ def run_optitrack_alignment_12d(config: OptitrackAlignmentConfig) -> dict[str, A
     opti, marker_columns = load_optitrack_markers(config.optitrack_csv)
     logger.info("OptiTrack rows=%d time=[%.3f, %.3f] marker_source=%s", len(opti), opti.time.min(), opti.time.max(), marker_columns["selected_marker_type"])
 
-    equal_seed, equal_candidates = optimize_equal_height_seed(fit_frames, opti, config)
-    candidate_frame(equal_candidates).to_csv(config.output_dir / "equal_height_candidate_results.csv", index=False)
+    equal_seed = optimize_equal_height_seed(fit_frames, opti, config)
 
     train_records, test_records = train_test_split_records(fit_frames, config.test_ratio, config.seed)
     logger.info("split: train_frames=%d test_frames=%d", len(train_records), len(test_records))
     lambda_values = parse_lambda_list(config.lambda_xy_list)
     fit_results = optimize_12d_offsets(train_records, test_records, fit_frames, opti, equal_seed, lambda_values, config)
     comparison_df = result_frame(fit_results)
-    comparison_df.to_csv(config.output_dir / "fit_comparison_summary.csv", index=False)
 
     chosen = select_result(fit_results, config.select_lambda)
     logger.info(
@@ -1197,8 +1056,6 @@ def run_optitrack_alignment_12d(config: OptitrackAlignmentConfig) -> dict[str, A
         chosen.all_rmse_m * 1000.0,
         chosen.xy_rms_m * 1000.0,
     )
-    offsets_frame(chosen).to_csv(config.output_dir / "marker_corner_offsets.csv", index=False)
-
     final_fit = fit_transform_for_params(
         fit_frames,
         opti,
@@ -1210,20 +1067,12 @@ def run_optitrack_alignment_12d(config: OptitrackAlignmentConfig) -> dict[str, A
     if final_fit is None:
         raise RuntimeError("Final transform fitting failed")
     error_summary = write_error_tables(config.output_dir, final_fit)
-    transform = write_transform_json(
+    alignment = write_alignment_toml(
         config.output_dir,
-        config.world_points_csv,
-        config.optitrack_csv,
-        marker_columns,
         chosen,
         final_fit,
-        error_summary,
-        equal_seed,
-        len(train_records),
-        len(test_records),
     )
-    plot_paths = write_plots(config.output_dir, final_fit, comparison_df) if config.write_plots else []
-    write_markdown_report(config.output_dir, transform, comparison_df, plot_paths)
+    write_markdown_report(config.output_dir, alignment, comparison_df, chosen, equal_seed, world_quality, error_summary)
 
     logger.info(
         "FINAL rmse=%.6fmm mean=%.6fmm offset=%.9fs scale=%.9f outputs=%s",
@@ -1233,7 +1082,17 @@ def run_optitrack_alignment_12d(config: OptitrackAlignmentConfig) -> dict[str, A
         final_fit.scale,
         config.output_dir,
     )
-    return transform
+    return {
+        "alignment": alignment,
+        "error_summary": error_summary,
+        "chosen_lambda_xy": chosen.lambda_xy,
+        "outputs": {
+            "alignment_toml": str(config.output_dir / ALIGNMENT_TOML_NAME),
+            "report_md": str(config.output_dir / REPORT_MD_NAME),
+            "point_errors_csv": str(diagnostic_output_paths(config.output_dir)["point_errors"]),
+            "frame_errors_csv": str(diagnostic_output_paths(config.output_dir)["frame_errors"]),
+        },
+    }
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -1261,7 +1120,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--equal-height-maxiter", type=int, default=260)
     parser.add_argument("--offset-12d-maxiter", type=int, default=500)
     parser.add_argument("--allow-global-scale", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--write-plots", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--log-level", default="INFO")
     return parser
 
@@ -1299,7 +1157,6 @@ def main(argv: list[str] | None = None) -> int:
             equal_height_maxiter=args.equal_height_maxiter,
             offset_12d_maxiter=args.offset_12d_maxiter,
             allow_global_scale=args.allow_global_scale,
-            write_plots=args.write_plots,
         )
     )
     return 0

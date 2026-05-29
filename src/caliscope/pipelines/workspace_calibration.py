@@ -123,7 +123,6 @@ class WorkspaceCalibrationConfig:
     optitrack_allow_global_scale: bool = True
     optitrack_test_ratio: float = 0.33
     optitrack_seed: int = 20260521
-    optitrack_write_plots: bool = True
     plan_only: bool = False
     allow_partial_extrinsics: bool = False
 
@@ -475,27 +474,23 @@ def _run_optitrack_alignment_stage(
             equal_height_maxiter=config.optitrack_equal_height_maxiter,
             offset_12d_maxiter=config.optitrack_offset_12d_maxiter,
             allow_global_scale=config.optitrack_allow_global_scale,
-            write_plots=config.optitrack_write_plots,
         )
     )
-    error_summary = transform.get("fit_error_all_refit", {})
+    alignment = transform["alignment"]
+    error_summary = transform.get("error_summary", {})
+    outputs = transform.get("outputs", {})
     report = {
         **plan,
         "status": "completed",
-        "schema_version": transform.get("schema_version"),
-        "model_type": transform.get("model_type"),
+        "schema_version": alignment.get("schema_version"),
+        "alignment_model": alignment.get("alignment_model"),
         "chosen_lambda_xy": transform.get("chosen_lambda_xy"),
-        "time_offset_seconds": transform.get("time_offset_seconds"),
-        "scale_opti_to_camera_world": transform.get("scale_opti_to_camera_world"),
+        "time_offset_seconds": alignment.get("time_offset_seconds"),
+        "scale_optitrack_to_camera_world": alignment.get("optitrack_to_camera_world", {}).get("scale"),
         "rmse_mm": None if "rmse_m" not in error_summary else float(error_summary["rmse_m"]) * 1000.0,
         "mean_error_mm": None if "mean_m" not in error_summary else float(error_summary["mean_m"]) * 1000.0,
         "p95_error_mm": None if "p95_m" not in error_summary else float(error_summary["p95_m"]) * 1000.0,
-        "outputs": {
-            "alignment_transform_12d_summary": str(output_dir / "alignment_transform_12d_summary.json"),
-            "alignment_transform_summary": str(output_dir / "alignment_transform_summary.json"),
-            "transform_only": str(output_dir / "transform_only.json"),
-            "report": str(output_dir / "REPORT.md"),
-        },
+        "outputs": outputs,
     }
     logger.info("OptiTrack alignment complete. RMSE: %.4f mm", report["rmse_mm"])
     return report
@@ -2125,7 +2120,6 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--optitrack-allow-global-scale", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--optitrack-test-ratio", type=float, default=0.33, help="Train/test split ratio for lambda comparison")
     parser.add_argument("--optitrack-seed", type=int, default=20260521, help="Random seed for train/test split")
-    parser.add_argument("--optitrack-write-plots", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--plan-only", action="store_true", help="Print planned reuse/recompute stages and exit")
     parser.add_argument(
         "--allow-partial-extrinsics",
@@ -2194,7 +2188,6 @@ def main(argv: list[str] | None = None) -> int:
         optitrack_allow_global_scale=args.optitrack_allow_global_scale,
         optitrack_test_ratio=args.optitrack_test_ratio,
         optitrack_seed=args.optitrack_seed,
-        optitrack_write_plots=args.optitrack_write_plots,
         plan_only=args.plan_only,
         allow_partial_extrinsics=args.allow_partial_extrinsics,
     )

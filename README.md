@@ -143,15 +143,13 @@ calibration/extrinsic/optitrack_alignment_12d
 
 | 文件 | 作用 |
 | --- | --- |
-| `alignment_transform_12d_summary.json` | 完整 12D offset、时间偏移、Sim(3) 正反变换、误差和输入来源。 |
-| `alignment_transform_summary.json` | 与上面相同，兼容旧 downstream 文件名。 |
-| `transform_only.json` | downstream 更方便读取的最小变换接口。 |
-| `fit_comparison_summary.csv` | `lambda_xy` sweep 的 train/test/all 误差。 |
-| `aligned_point_errors.csv` | 每个内角点的 3D 对齐误差。 |
-| `alignment_frame_error_summary.csv` | 每帧 RMSE/p95/max。 |
+| `optitrack_to_camera_world_alignment.toml` | 唯一的可复用结果文件；包含时间偏移、OptiTrack 到 camera-world 的正反 Sim(3) 变换，以及标定板 12D marker-to-corner 修正参数。 |
+| `optitrack_to_camera_world_alignment_report.md` | 人看的质量报告；包含最终误差、lambda sweep、marker offset 表和诊断 CSV 说明。 |
+| `diagnostics/optitrack_to_camera_world_alignment_point_errors.csv` | 可选排查文件；每一行是一个标定板内角点观测的 3D 对齐残差。 |
+| `diagnostics/optitrack_to_camera_world_alignment_frame_errors.csv` | 可选排查文件；每一行是一个 world_points 帧的 mean/RMSE/p95/max 残差。 |
 | `calibration_report.toml` 的 `[optitrack_alignment]` | workflow 汇总：RMSE、`lambda_xy`、时间偏移、输出路径。 |
 
-当前推荐 `--optitrack-select-lambda 0.2`。使用输出变换时，普通 OptiTrack 点只应使用全局 Sim(3) 与时间偏移；`marker_corner_local_offsets_*` 只描述该标定板四个 marker 中心到纸面角点的局部修正，不应套到其他物体。
+当前推荐 `--optitrack-select-lambda 0.2`。普通 OptiTrack 点使用 `optitrack_to_camera_world_alignment.toml` 中的全局 Sim(3) 与时间偏移；`calibration_board_marker_correction` 只描述该标定板四个 marker 中心到纸面角点的局部修正，不应套到其他物体。
 
 ## 6. 完整阶段说明
 
